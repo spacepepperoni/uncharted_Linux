@@ -781,6 +781,21 @@ static void sample_host(PadData *d) {
     uint32_t mouse=0;
     int wheel=0, captured=bbgpu_mouse_sample(&mdx,&mdy,&mouse,&wheel);
     if (bbgpu_overlay_captures_input()) return; /* settings menu open: neutral input */
+    /* Linux fork, testing: BB_MARK=1: a back grip (Steam Deck L4/R4/L5/R5, SDL paddles; unused by
+     * the games) logs "Mark N" with the time, for a player to flag a moment or a stretch of play. */
+    static int mark_enabled=-1, mark_down, marks;
+    if (mark_enabled<0) { const char *e=getenv("BB_MARK"); mark_enabled=e && e[0]=='1'; }
+    if (mark_enabled && g) {
+        const int down=SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_LEFT_PADDLE1) ||
+                       SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1) ||
+                       SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_LEFT_PADDLE2) ||
+                       SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_RIGHT_PADDLE2);
+        if (down && !mark_down) {
+            printf("Mark %d at %.2f s\n",++marks,now_us()*1e-6);
+            fflush(stdout);
+        }
+        mark_down=down;
+    }
     /* Scripted runs (BB_PAD_FILE) ignore the player's controller and keyboard: a pad in use on
      * the same PC reached the test window (BB_PAD_HOST=1 keeps them). */
     static int scripted=-1;
