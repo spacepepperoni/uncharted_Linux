@@ -13,6 +13,7 @@
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
+#include "video_core/renderer_vulkan/vk_vram.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -25,41 +26,6 @@ using namespace Vulkan;
 Common::IncrementalIdProvider<u64> Image::global_image_uid{};
 
 namespace {
-
-/// bbport: discrete GPUs: the memory types outside VRAM, when VRAM is within `reserve` of the
-/// driver's budget; 0 otherwise. The buffer cache backs guest memory in VRAM as areas load, and
-/// on NVIDIA that backing cannot go anywhere else: textures made near the limit go to system
-/// memory instead (slower, but the next area still finds room; ErrorOutOfDeviceMemory on 4 GB
-/// cards otherwise). Integrated GPUs (Steam Deck) keep their own rules.
-u32 SystemMemoryTypesNearVramLimit(VmaAllocator allocator) {
-    const VkPhysicalDeviceProperties* device{};
-    vmaGetPhysicalDeviceProperties(allocator, &device);
-    if (device->deviceType != VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) {
-        return 0;
-    }
-    const VkPhysicalDeviceMemoryProperties* memory{};
-    vmaGetMemoryProperties(allocator, &memory);
-    VmaBudget budgets[VK_MAX_MEMORY_HEAPS]{};
-    vmaGetHeapBudgets(allocator, budgets);
-    bool near_limit = false;
-    for (u32 heap = 0; heap < memory->memoryHeapCount; ++heap) {
-        if (memory->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-            const u64 reserve = std::min<u64>(512ull << 20, memory->memoryHeaps[heap].size / 8);
-            near_limit |= budgets[heap].usage + reserve > budgets[heap].budget;
-        }
-    }
-    if (!near_limit) {
-        return 0;
-    }
-    u32 types = 0;
-    for (u32 type = 0; type < memory->memoryTypeCount; ++type) {
-        const u32 heap = memory->memoryTypes[type].heapIndex;
-        if (!(memory->memoryHeaps[heap].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)) {
-            types |= 1u << type;
-        }
-    }
-    return types;
-}
 
 } // namespace
 
@@ -130,9 +96,7 @@ static vk::FormatFeatureFlags2 FormatFeatureFlags(const vk::ImageUsageFlags usag
 }
 
 UniqueImage::~UniqueImage() {
-    if (image) {
-        vmaDestroyImage(allocator, image, allocation);
-    }
+    Destroy();
 }
 
 void UniqueImage::Destroy() {
@@ -140,6 +104,9 @@ void UniqueImage::Destroy() {
         vmaDestroyImage(allocator, image, allocation);
         image = vk::Image{};
         allocation = {};
+        Vulkan::Vram::image_bytes.fetch_sub(size_bytes, std::memory_order_relaxed);
+        Vulkan::Vram::image_count.fetch_sub(1, std::memory_order_relaxed);
+        size_bytes = 0;
     }
 }
 
@@ -159,32 +126,38 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
     VkImage unsafe_image{};
     VmaAllocationInfo alloc_info{};
     VkResult result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-    if (const u32 system_types = SystemMemoryTypesNearVramLimit(allocator)) {
-        VmaAllocationCreateInfo system = alloc_ci;
-        system.memoryTypeBits = system_types;
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &system, &unsafe_image, &allocation,
+    u64 estimate = 0;
+    if (Vulkan::Vram::TestLimit() && device) {
+        const vk::DeviceImageMemoryRequirements req{.pCreateInfo = &image_ci};
+        estimate = device.getImageMemoryRequirements(req).memoryRequirements.size;
+    }
+    if (Vulkan::Vram::Allows(estimate)) {
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
                                 &alloc_info);
-        if (result == VK_SUCCESS) {
-            Vulkan::NoteOverBudget("image");
+    }
+    if (result != VK_SUCCESS && !Vulkan::Vram::Legacy()) {
+        // bbport: over the driver's budget. Evicting from here is not safe (the caller holds the
+        // texture cache and may be walking it): ask the collector to be aggressive at the next
+        // submission and let the driver place the image outside the budget (it pages other
+        // memory out; on a card that really has no room this still fails).
+        Vulkan::Vram::failed_allocs.fetch_add(1, std::memory_order_relaxed);
+        Vulkan::Vram::urgent.store(true, std::memory_order_relaxed);
+        if (!Vulkan::Vram::Strict() || Vulkan::Vram::Allows(estimate)) {
+            VmaAllocationCreateInfo relaxed = alloc_ci;
+            relaxed.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateImage(allocator, &image_ci_unsafe, &relaxed, &unsafe_image,
+                                    &allocation, &alloc_info);
+            if (result == VK_SUCCESS) {
+                Vulkan::Vram::recovered_allocs.fetch_add(1, std::memory_order_relaxed);
+            }
         }
-    }
-    if (result != VK_SUCCESS) {
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image,
-                                &allocation, &alloc_info);
-    }
-    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-        // bbport: VRAM full (6 GB cards, high resolutions). Past the budget the driver keeps the
-        // image in system memory, which is slower but no crash.
-        Vulkan::NoteOverBudget("image");
-        VmaAllocationCreateInfo over_budget = alloc_ci;
-        over_budget.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
-        result = vmaCreateImage(allocator, &image_ci_unsafe, &over_budget, &unsafe_image,
-                                &allocation, &alloc_info);
     }
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    Vulkan::Vram::image_bytes.fetch_add(size_bytes, std::memory_order_relaxed);
+    Vulkan::Vram::image_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,

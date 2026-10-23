@@ -523,6 +523,7 @@ def deck_environment(settings, env):
     env['BB_PRESENT_MODE'] = 'Fifo'      # gamescope paces FIFO best
     env['BB_FULLSCREEN'] = '1'
     env['BB_FRAME_STATS'] = '1'          # frame time breakdown in last_run.log (tuning the Deck)
+    env['BB_DECK_PROMPTS'] = '1'         # Xbox button pictures with black and white A B X Y
     for key, name in (('anti_aliasing', 'BB_UPSCALER'), ('frame_generation', 'BB_FRAME_GEN'),
                       ('frame_gen_multiplier', 'BB_FRAME_GEN_MULTIPLIER')):
         if not deck_allows(key, str(settings.get(key) or '')):
@@ -988,6 +989,7 @@ def launcher_class(base, ns):
 
         def nav_pages(self):
             return [('play', _('Library')), ('display', _('Settings')), ('controls', _('Controls')),
+                    ('cheats', _('Cheats')), ('fixes', _('Fixes')), ('trophies', _('Trophies')),
                     ('game', _('Files')), ('advanced', _('Advanced'))]
 
         def build_header(self):

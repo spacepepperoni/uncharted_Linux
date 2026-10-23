@@ -15,6 +15,10 @@ extern "C" {
 
 namespace Libraries::Videodec2 {
 
+/// BB_GAME_RES (WxH): the games read decoded movie frames at their display size, so frames are
+/// fitted (aspect kept, black bars) into a canvas of that size. 0 when the game runs at 1920x1080.
+void GameResolution(s32& width, s32& height);
+
 class VdecDecoder {
 public:
     VdecDecoder(const OrbisVideodec2DecoderConfigInfo& configInfo,
