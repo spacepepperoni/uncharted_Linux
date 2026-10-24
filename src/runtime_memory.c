@@ -18,6 +18,7 @@
 #include <errno.h>
 #ifdef _WIN32
 #include <windows.h>
+#include <psapi.h>
 #else
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -135,11 +136,52 @@ static void region_insert(size_t at, HostRegion r) {
 static void region_erase(size_t at, size_t n) {
     memmove(regions+at,regions+at+n,(region_count-at-n)*sizeof(*regions)); region_count-=n;
 }
+/* Something else lives in the range (a DLL an overlay or an antivirus injects, a heap): the reservation
+ * fails with error 487, and what it is differs from launch to launch ("only sometimes after pressing
+ * play countless times", issue #334). Say what sits there and start the game again, up to 8 times, as
+ * a child process of this one: its exit code is ours. BB_TEST_OCCUPY=1 puts a block in the range on
+ * the first try, to test this. */
+static void reserve_failed(void) {
+    const DWORD error=GetLastError();
+    int listed=0;
+    for (uintptr_t at=USER_MIN; at<USER_MAX && listed<8;) {
+        MEMORY_BASIC_INFORMATION m;
+        if (!VirtualQuery((void *)at,&m,sizeof(m))) break;
+        if (m.State!=MEM_FREE) {
+            char name[MAX_PATH]="";
+            K32GetMappedFileNameA(GetCurrentProcess(),m.BaseAddress,name,sizeof(name));
+            printf("Runtime: the PS4 address range is not free: %p +0x%zx (%s)\n",m.BaseAddress,(size_t)m.RegionSize,name[0] ? name : "no file");
+            ++listed;
+        }
+        at=(uintptr_t)m.BaseAddress+m.RegionSize;
+    }
+    const char *text=getenv("BB_RESERVE_TRY");
+    const int tries=text ? atoi(text) : 0;
+    if (tries<8) {
+        char number[16];
+        snprintf(number,sizeof(number),"%d",tries+1);
+        SetEnvironmentVariableA("BB_RESERVE_TRY",number);
+        STARTUPINFOA startup={.cb=sizeof(startup)};
+        PROCESS_INFORMATION process;
+        char *line=_strdup(GetCommandLineA());
+        printf("Runtime: starting again (try %d of 8)\n",tries+1);
+        fflush(NULL);
+        if (line && CreateProcessA(NULL,line,NULL,NULL,TRUE,0,NULL,NULL,&startup,&process)) {
+            DWORD code=21;
+            WaitForSingleObject(process.hProcess,INFINITE);
+            GetExitCodeProcess(process.hProcess,&code);
+            exit((int)code);
+        }
+    }
+    SetLastError(error);
+    win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
+}
 /* The guest range is reserved before anything else can be placed there (runtime_start). */
 void runtime_memory_reserve(void) {
     if (region_count) return;
+    if (getenv("BB_TEST_OCCUPY") && !getenv("BB_RESERVE_TRY")) VirtualAlloc((void *)0x1400000000ull,0x10000,MEM_RESERVE,PAGE_NOACCESS);
     if (!VirtualAlloc2(NULL,(void *)USER_MIN,USER_MAX-USER_MIN,MEM_RESERVE|MEM_RESERVE_PLACEHOLDER,PAGE_NOACCESS,NULL,0))
-        win_fail("reserving the PS4 address range (link with --disable-high-entropy-va)",USER_MIN,USER_MAX-USER_MIN);
+        reserve_failed();
     region_insert(0,(HostRegion){USER_MIN,USER_MAX,0,0});
 }
 static void view_map(const HostRegion *r, DWORD protect) {
@@ -330,7 +372,9 @@ static int split_at(uintptr_t a) {
     if (i==vma_count || vmas[i].start>=a) return 0;
     Vma right=vmas[i];
     right.start=a;
-    if (right.kind==KIND_DIRECT) right.phys+=a-vmas[i].start;
+    /* Direct and flexible mappings both sit on the backing pool at a byte offset: the right half
+     * continues from where the left half stops (write_backing and drop_range read phys). */
+    if (right.kind==KIND_DIRECT || right.kind==KIND_FLEXIBLE) right.phys+=a-vmas[i].start;
     vmas[i].end=a;
     return vma_insert(i+1,right);
 }
@@ -419,7 +463,10 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
      * that search so the larger render target heaps fit. */
     if ((uint64_t)high >= UINT64_C(5056) * 1024 * 1024 && (uint64_t)high < POOL_SIZE) high = (int64_t)POOL_SIZE;
     uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
-    if ((uint64_t)low >= end || size > end - (uint64_t)low) return NO_SPACE;
+    if ((uint64_t)low >= end || size > end - (uint64_t)low) {
+        printf("Runtime: direct allocation of %" PRIu64 " bytes in [%#" PRIx64 ", %#" PRIx64 ") refused: no space (pool %" PRIu64 " bytes)\n",size,(uint64_t)low,(uint64_t)high,(uint64_t)POOL_SIZE);
+        return NO_SPACE;
+    }
     write_lock();
     if (pool()) { write_unlock(); return NO_MEMORY; }
     uint64_t start = align_up((uint64_t)low, alignment);

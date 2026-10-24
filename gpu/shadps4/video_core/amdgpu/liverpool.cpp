@@ -27,6 +27,7 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include "video_core/landing_gate.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 
@@ -41,6 +42,17 @@ static std::chrono::microseconds SubmitDelay() {
         return env ? std::strtoll(env, nullptr, 10) : 0LL;
     }()};
     return delay;
+}
+
+// bbport test: BB_GPU_WAIT_SLEEP_US=<us> sleeps that long once every queue has stayed waiting on
+// memory for a while, instead of cycling through them (a CPU thread at 100% that the Deck's
+// other emulator threads share a core with). 0 or unset: spin as before.
+static std::chrono::microseconds WaitSleep() {
+    static const std::chrono::microseconds sleep{[] {
+        const char* env = std::getenv("BB_GPU_WAIT_SLEEP_US");
+        return env ? std::strtoll(env, nullptr, 10) : 0LL;
+    }()};
+    return sleep;
 }
 
 static const char* dcb_task_name{"DCB_TASK"};
@@ -152,11 +164,34 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
+        // Queue visits since a task last finished: once past every queue, all are waiting.
+        u32 waiting_visits = 0;
+        std::chrono::steady_clock::time_point spin_start{};
+        const auto end_spin = [&] {
+            if (waiting_visits > num_mapped_queues) {
+                BbStats::queue_spin_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - spin_start).count(),
+                    std::memory_order_relaxed);
+            }
+            waiting_visits = 0;
+        };
 
         while (num_submits || num_commands) {
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
+            if (++waiting_visits == num_mapped_queues + 1) {
+                spin_start = std::chrono::steady_clock::now();
+            } else if (waiting_visits > 64 * num_mapped_queues && curr_qid == 0 &&
+                       WaitSleep().count()) {
+                const auto sleep_start = std::chrono::steady_clock::now();
+                std::this_thread::sleep_for(WaitSleep());
+                BbStats::queue_sleep_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - sleep_start).count(),
+                    std::memory_order_relaxed);
+            }
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -179,6 +214,7 @@ void Liverpool::Process(std::stop_token stoken) {
             task.resume();
 
             if (task.done()) {
+                end_spin();
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -287,6 +323,8 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 // the draw recording thread when the draw pipeline is in use).
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
+    // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
     rasterizer.ProcessDownloadImages();
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
@@ -318,15 +356,17 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
         return env && env[0] == '1';
     }();
     if (async_fences && !BbToggle::Disabled(BbToggle::AsyncFences)) {
+        VideoCore::LandingGate::Wait(landing_seq);
         BbCopy::AfterCopies([eop] { SignalEop(eop); });
     } else if (Vulkan::DrawPipe::OnStageB() && !BbToggle::Disabled(BbToggle::RecorderFences)) {
         // The draw recording thread does not wait: the Vulkan recording thread signals the
         // fence after the copies queued before it.
-        rasterizer.SignalAfterHostCopies([eop] { SignalEop(eop); });
+        rasterizer.SignalAfterHostCopies([eop] { SignalEop(eop); }, landing_seq);
     } else {
         // Labels are written in order: not before the ones deferred to the recording thread.
         rasterizer.WaitHostCopies();
         rasterizer.WaitDeferredSignals();
+        VideoCore::LandingGate::Wait(landing_seq);
         SignalEop(eop);
     }
 }
@@ -438,7 +478,21 @@ void RunDmaData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 }
 
 void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
+    // Raycaster copies deferred before the flip land before the guest hears of it (the labels
+    // before it wait for them as well, landing_gate.h).
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
+    if (VideoCore::LandingGate::Active() && Vulkan::DrawPipe::OnStageB() &&
+        !BbToggle::Disabled(BbToggle::RecorderFences)) {
+        // Behind the deferred fences, which the interrupt must not overtake, without waiting.
+        rasterizer.OnGuestFlip();
+        rasterizer.GetBufferCache().CheckStableBindings();
+        rasterizer.CheckConstants();
+        rasterizer.SignalAfterHostCopies(
+            [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip); }, landing_seq);
+        return;
+    }
     rasterizer.WaitDeferredSignals();
+    VideoCore::LandingGate::Wait(landing_seq);
     rasterizer.OnGuestFlip();
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
@@ -452,6 +506,7 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();
     rasterizer.WaitDeferredSignals();
+    VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
@@ -461,20 +516,37 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
 }
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
-    const auto& event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
+    const auto event_eos = *reinterpret_cast<const PM4CmdEventWriteEos*>(data);
+    // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
+    const u64 landing_seq = VideoCore::LandingGate::Pending();
     // Copies deferred to the recording thread precede writes the guest sees.
+    const bool chained = VideoCore::LandingGate::Active() &&
+                         event_eos.command != PM4CmdEventWriteEos::Command::GdsStore &&
+                         Vulkan::DrawPipe::OnStageB() &&
+                         !BbToggle::Disabled(BbToggle::RecorderFences);
     rasterizer.WaitHostCopies();
-    rasterizer.WaitDeferredSignals();
+    if (!chained) {
+        rasterizer.WaitDeferredSignals();
+    }
     rasterizer.ProcessDownloadImages();
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
-    event_eos.SignalFence([](void* address, u64 value, u32 num_bytes) {
+    const auto write = [](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
         if (!memory->TryWriteBacking(address, &value, num_bytes)) {
             memcpy(address, &value, num_bytes);
         }
-    });
+    };
+    if (chained) {
+        // The label is written once the copies have landed, in order with the other deferred
+        // fences (later guest-visible writes wait for it): this thread does not block.
+        rasterizer.SignalAfterHostCopies([event_eos, write] { event_eos.SignalFence(write); },
+                                         landing_seq);
+        return;
+    }
+    VideoCore::LandingGate::Wait(landing_seq);
+    event_eos.SignalFence(write);
     if (event_eos.command == PM4CmdEventWriteEos::Command::GdsStore) {
         ASSERT(event_eos.size == 1);
         rasterizer.Finish();
@@ -584,6 +656,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
                 YIELD_CE();
                 RESUME_CE(task);
             }
+            // The nested task's coroutine frame is ours to free (final_suspend keeps it); without
+            // this the host heap grew by one frame per indirect buffer for the whole session.
             task.handle.destroy();
             break;
         }
@@ -607,6 +681,21 @@ u64 Liverpool::HashRegisterPacket(u64 checksum, const u32* words, u32 count) {
         checksum ^= checksum >> 29;
     }
     return checksum;
+}
+
+void Liverpool::ApplyComputeRegisterPacket(ComputeProgram& cs, const PM4Header* header) {
+    if (header->type3.opcode != PM4ItOpcode::SetShReg) {
+        return;
+    }
+    const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
+    const auto set_size = (header->type3.NumWords() - 1) * sizeof(u32);
+    if (set_data->reg_offset >= 0x200 &&
+        set_data->reg_offset <= (0x200 + sizeof(ComputeProgram) / 4) &&
+        set_size <= sizeof(ComputeProgram) &&
+        (set_data->reg_offset - 0x200) * sizeof(u32) + set_size <= sizeof(ComputeProgram)) {
+        std::memcpy(reinterpret_cast<u32*>(&cs) + (set_data->reg_offset - 0x200), header + 2,
+                    set_size);
+    }
 }
 
 void Liverpool::ApplyGraphicsRegisterPacket(Regs& regs, const PM4Header* header, u64& checksum,
@@ -841,7 +930,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     Vulkan::DrawPreparation* draw_prep =
         seq != NoSeq && rasterizer ? &rasterizer->GetDrawPreparation() : nullptr;
     if (draw_prep) {
-        draw_prep->BeginSubmission(seq, regs, gfx_reg_checksum);
+        draw_prep->BeginSubmission(seq, regs, gfx_reg_checksum, mapped_queues[GfxQueueId].cs_state);
     }
     static const bool dcb_stats = EmulatorSettingsImpl::Flag("BB_DCB_STATS", false);
     const int dcb_depth = g_dcb_depth;
@@ -1334,8 +1423,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
-                    while (!mem_semaphore->Signaled()) {
-                        YIELD_GFX();
+                    if (!mem_semaphore->Signaled()) {
+                        const auto wait_start = std::chrono::steady_clock::now();
+                        while (!mem_semaphore->Signaled()) {
+                            YIELD_GFX();
+                        }
+                        BbStats::NoteQueueWait(BbStats::gfx_wait_ns, BbStats::gfx_waits, wait_start,
+                                               mem_semaphore->Address<VAddr>());
                     }
                     mem_semaphore->Decrement();
                 }
@@ -1382,12 +1476,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    if (rasterizer && !rasterizer->DrawPipeIdle()) {
-                        rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
-                        continue;
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                            continue;
+                        }
+                        YIELD_GFX();
                     }
-                    YIELD_GFX();
+                    BbStats::NoteQueueWait(BbStats::gfx_wait_ns, BbStats::gfx_waits, wait_start,
+                                           wait_reg_mem->Address<VAddr>());
                 }
                 break;
             }
@@ -1404,7 +1503,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
-                task.handle.destroy();
+                task.handle.destroy(); // see IndirectBufferConst (CE)
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -1598,7 +1697,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
-            task.handle.destroy();
+            task.handle.destroy(); // see IndirectBufferConst (CE)
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -1738,6 +1837,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->WaitHostCopies();
                 rasterizer->WaitDeferredSignals();
+                VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
             }
             const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(header);
             ASSERT(write_data->dst_sel.Value() == 2 || write_data->dst_sel.Value() == 5);
@@ -1754,8 +1854,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
-                while (!mem_semaphore->Signaled()) {
-                    YIELD_ASC(vqid);
+                if (!mem_semaphore->Signaled()) {
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    while (!mem_semaphore->Signaled()) {
+                        YIELD_ASC(vqid);
+                    }
+                    BbStats::NoteQueueWait(BbStats::asc_wait_ns, BbStats::asc_waits, wait_start,
+                                           mem_semaphore->Address<VAddr>());
                 }
                 mem_semaphore->Decrement();
             }
@@ -1764,8 +1869,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                const auto wait_start = std::chrono::steady_clock::now();
+                while (!wait_reg_mem->Test(regs.reg_array)) {
+                    YIELD_ASC(vqid);
+                }
+                BbStats::NoteQueueWait(BbStats::asc_wait_ns, BbStats::asc_waits, wait_start,
+                                       wait_reg_mem->Address<VAddr>());
             }
             break;
         }
@@ -1784,6 +1894,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (rasterizer) {
                 rasterizer->WaitHostCopies();
                 rasterizer->WaitDeferredSignals();
+                VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
                 rasterizer->GetBufferCache().CheckStableBindings();
                 rasterizer->CheckConstants();
             }

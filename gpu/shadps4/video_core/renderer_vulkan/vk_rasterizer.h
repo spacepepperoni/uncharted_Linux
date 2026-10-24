@@ -134,8 +134,8 @@ public:
         scheduler.WaitDeferredSignals();
     }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
-    void SignalAfterHostCopies(std::function<void()> signal) {
-        scheduler.SignalAfterHostCopies(std::move(signal));
+    void SignalAfterHostCopies(std::function<void()> signal, u64 landing_seq = 0) {
+        scheduler.SignalAfterHostCopies(std::move(signal), landing_seq);
     }
     /// The GPU command thread or the draw recording thread (fault handling runs inline there).
     bool IsGpuSideThread() const;
@@ -300,6 +300,8 @@ private:
     /// Whether the helper may bind textures for this pipeline at all (fixed descriptor layout,
     /// no storage writes that invalidate cached images).
     bool HelperEligible(const Pipeline* pipeline) const;
+    /// The current draw writes a display buffer and FrameCapture collects icons.
+    bool DrawsToDisplayForIcons() const;
     /// Whether every texture of `stage` takes the memoized path without refreshing, creating or
     /// redirecting anything that records commands or touches the buffer cache.
     bool TexturesBindableOnHelper(const Shader::Info& stage, const PreparedStage* prepared);

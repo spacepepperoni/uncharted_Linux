@@ -14,7 +14,9 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/renderer_vulkan/vk_xess.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_vram.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
 #include <vk_mem_alloc.h>
@@ -534,6 +536,18 @@ bool Instance::CreateDevice() {
             }
         }
     }
+    // bbport: Intel XeSS (optional libxess.dll) asks for its own device extensions and features.
+    if (Xess* xess = Xess::Get()) {
+        std::vector<const char*> xess_extensions;
+        xess->AppendDeviceExtensions(*instance, physical_device, xess_extensions);
+        for (const char* name : xess_extensions) {
+            if (std::none_of(enabled_extensions.begin(), enabled_extensions.end(),
+                             [&](const char* e) { return std::string_view{e} == name; }) &&
+                enabled_extensions.size() < enabled_extensions.capacity()) {
+                enabled_extensions.push_back(name);
+            }
+        }
+    }
     vk::StructureChain device_chain = {
         vk::DeviceCreateInfo{
             .queueCreateInfoCount = static_cast<u32>(queue_infos.size()),
@@ -757,6 +771,11 @@ bool Instance::CreateDevice() {
         device_chain.unlink<vk::PhysicalDeviceShaderMixedFloatDotProductFeaturesVALVE>();
     }
 
+    // bbport: XeSS enables its features in the chain (and may append structures to its end).
+    if (Xess* xess = Xess::Get()) {
+        xess->PatchDeviceFeatures(*instance, physical_device,
+                                  &device_chain.get<vk::PhysicalDeviceFeatures2>());
+    }
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create device: {}", vk::to_string(device_result));
@@ -767,6 +786,9 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
     if (Dlss* dlss = Dlss::Get()) {
         dlss->Initialize(*instance, physical_device, *device);
+    }
+    if (Xess* xess = Xess::Get()) {
+        xess->Initialize(*instance, physical_device, *device);
     }
 
     graphics_queue = device->getQueue(queue_family_index, 0);
@@ -823,6 +845,9 @@ bool Instance::CreateDevice() {
     }
 
     CreateAllocator();
+    static const Instance* vram_instance = nullptr;
+    vram_instance = this;
+    Vram::allows = [](u64 bytes) { return vram_instance->VramAllows(bytes); };
     return true;
 }
 
@@ -832,19 +857,28 @@ void Instance::CreateAllocator() {
         .vkGetDeviceProcAddr = VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr,
     };
 
-    // bbport: with VK_EXT_memory_budget VMA's budget checks (WITHIN_BUDGET) use the driver's
-    // usage, which counts the buffer cache's guest memory backing (allocated directly, not
-    // through VMA). Without it VMA only counted its own allocations against 80% of VRAM: on
-    // 4 GB cards textures filled VRAM next to 2-3 GB of backing, and the next area's backing
-    // found no room ("ErrorOutOfDeviceMemory"; on NVIDIA it can only be in VRAM).
-    VmaAllocatorCreateFlags allocator_flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT;
-    if (supports_memory_budget) {
-        allocator_flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+    // bbport: VMA takes device memory in 256 MiB blocks on big heaps: on a card of 6 GB or less
+    // that left ~180 MiB of slack with 1.3 GB allocated. 64 MiB blocks (dedicated allocations
+    // for anything big) cost nothing noticeable.
+    u64 local_heap = ~u64{0};
+    for (u32 i = 0; i < memory_properties.memoryHeapCount; ++i) {
+        if (memory_properties.memoryHeaps[i].flags & vk::MemoryHeapFlagBits::eDeviceLocal) {
+            local_heap = std::min<u64>(local_heap, memory_properties.memoryHeaps[i].size);
+        }
     }
+    if (const u64 test_limit = Vram::TestLimit()) {
+        local_heap = std::min(local_heap, test_limit);
+    }
+    const bool small_card = !IsIntegrated() && !Vram::Legacy() && local_heap <= 6_GB;
     const VmaAllocatorCreateInfo allocator_info = {
-        .flags = allocator_flags,
+        // bbport: with VK_EXT_memory_budget VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT (images,
+        // buffers) compares with the driver's budget, which counts the buffer arenas and the
+        // other processes; without it VMA only knew its own blocks.
+        .flags = VMA_ALLOCATOR_CREATE_BUFFER_DEVICE_ADDRESS_BIT |
+                 (supports_memory_budget ? VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT : 0u),
         .physicalDevice = physical_device,
         .device = *device,
+        .preferredLargeHeapBlockSize = small_card ? 64_MB : 0,
         .pVulkanFunctions = &functions,
         .instance = *instance,
         .vulkanApiVersion = TargetVulkanApiVersion,
@@ -926,7 +960,15 @@ void Instance::CollectPhysicalMemoryInfo() {
         // If memory budget is not supported, use the size of the heap as the budget.
         total_memory_budget += memory_props.memoryHeaps[i].size;
     }
+    Vram::device_memory.store(Vram::TestLimit() ? Vram::TestLimit() : total_memory_budget,
+                              std::memory_order_relaxed);
     if (!IsIntegrated()) {
+        if (const u64 test_limit = Vram::TestLimit()) {
+            // bbport: BB_TEST_VRAM_MB: a card of that size; the driver's budget is ~90% of it.
+            total_memory_budget = test_limit / 10 * 9;
+            LOG_INFO(Render_Vulkan, "Video memory simulated: {} MiB ({}), budget {} MiB",
+                     test_limit >> 20, Vram::TestHard() ? "hard limit" : "soft", total_memory_budget >> 20);
+        }
         // We reserve some memory for the system.
         const u64 system_memory = std::min<u64>(total_memory_budget / 8, 1_GB);
         total_memory_budget -= system_memory;
@@ -1020,7 +1062,71 @@ u64 Instance::GetDeviceMemoryBudgetNow() const {
     for (const size_t heap : valid_heaps) {
         total_budget += memory_budget_props.heapBudget[heap];
     }
+    if (const u64 test_limit = Vram::TestLimit(); test_limit && !IsIntegrated()) {
+        total_budget = std::min<u64>(total_budget, test_limit / 10 * 9);
+    }
     return total_budget;
+}
+
+void Instance::QueryMemory(u64& usage, u64& budget) const {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT memory_budget_props{};
+    vk::PhysicalDeviceMemoryProperties2 props = {.pNext = &memory_budget_props};
+    physical_device.getMemoryProperties2(&props);
+    usage = 0;
+    budget = 0;
+    for (const size_t heap : valid_heaps) {
+        usage += memory_budget_props.heapUsage[heap];
+        budget += memory_budget_props.heapBudget[heap];
+    }
+    if (const u64 test_limit = Vram::TestLimit(); test_limit && !IsIntegrated()) {
+        budget = std::min<u64>(budget, test_limit / 10 * 9);
+    }
+}
+
+bool Instance::VramAllows(u64 bytes) const {
+    const u64 limit = Vram::TestLimit();
+    if (!limit || !Vram::TestHard() || IsIntegrated()) {
+        return true;
+    }
+    return GetDeviceMemoryUsage() + bytes <= limit / 10 * 9;
+}
+
+void Instance::ReportMemory(const char* why) const {
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props = {.pNext = &budget};
+    physical_device.getMemoryProperties2(&props);
+    u64 usage = 0, heap_budget = 0, size = 0;
+    for (const size_t heap : valid_heaps) {
+        usage += budget.heapUsage[heap];
+        heap_budget += budget.heapBudget[heap];
+        size += props.memoryProperties.memoryHeaps[heap].size;
+    }
+    VmaBudget vma[VK_MAX_MEMORY_HEAPS]{};
+    vmaGetHeapBudgets(allocator, vma);
+    u64 vma_blocks = 0, vma_allocs = 0, vma_count = 0, vma_block_count = 0;
+    for (const size_t heap : valid_heaps) {
+        vma_blocks += vma[heap].statistics.blockBytes;
+        vma_allocs += vma[heap].statistics.allocationBytes;
+        vma_count += vma[heap].statistics.allocationCount;
+        vma_block_count += vma[heap].statistics.blockCount;
+    }
+    std::printf("VRAM%s%s: allocs %llu+%llu (limit %u); process %llu MiB, driver budget %llu of %llu MiB; VMA blocks %llu MiB, "
+                "allocations %llu MiB; images %llu (%llu MiB), arenas %llu (%llu MiB, %llu MiB in system memory), buffers "
+                "%llu MiB; allocation failures %llu, recovered %llu, host fallbacks %llu\n",
+                why[0] ? " " : "", why, (unsigned long long)vma_block_count,
+                (unsigned long long)Vram::arena_count.load(),
+                properties.limits.maxMemoryAllocationCount, (unsigned long long)(usage >> 20),
+                (unsigned long long)(heap_budget >> 20), (unsigned long long)(size >> 20),
+                (unsigned long long)(vma_blocks >> 20), (unsigned long long)(vma_allocs >> 20),
+                (unsigned long long)Vram::image_count.load(),
+                (unsigned long long)(Vram::image_bytes.load() >> 20),
+                (unsigned long long)Vram::arena_count.load(),
+                (unsigned long long)(Vram::arena_bytes.load() >> 20),
+                (unsigned long long)(Vram::arena_host_bytes.load() >> 20),
+                (unsigned long long)(Vram::buffer_bytes.load() >> 20),
+                (unsigned long long)Vram::failed_allocs.load(),
+                (unsigned long long)Vram::recovered_allocs.load(),
+                (unsigned long long)Vram::host_fallbacks.load());
 }
 
 vk::FormatFeatureFlags2 Instance::GetFormatFeatureFlags(vk::Format format) const {

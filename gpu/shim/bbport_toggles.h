@@ -12,6 +12,7 @@
 typedef unsigned long long sigjmp_buf[32];
 extern "C" __attribute__((returns_twice)) int bb_setjmp(sigjmp_buf buffer);
 #define sigsetjmp(buffer, save) bb_setjmp(buffer)
+extern "C" [[noreturn]] void bb_longjmp(sigjmp_buf buffer, int value);
 #endif
 
 extern "C" std::uint64_t runtime_disabled_optimizations;
@@ -69,6 +70,8 @@ enum : std::uint64_t {
     // when nothing moves. Static-camera flicker of railings/window bars p99.9 -45% (2026-10-03).
     TaaKeepNearerHistory = 1ull << 55,
     SceneMipBias = 1ull << 57, ///< negative LOD bias of G-buffer samplers at reduced scene sizes
+    /// One upscaler frame start per frame (Uncharted draws twice into its display buffer).
+    OneFrameStart = 1ull << 59,
     // Bits 20-29 are used as raw debug toggles by the camera/object motion and the upscaler.
 };
 inline bool Disabled(std::uint64_t bit) {
@@ -120,6 +123,24 @@ struct Timer {
 };
 /// Wall time the GPU command thread waited for guest submissions (ns).
 inline std::atomic<std::uint64_t> gpu_idle_ns{0};
+/// Command queues waiting on memory (WaitRegMem, MemSemaphore): wall time (ns) and waits, the
+/// graphics and compute queues apart; the longest single wait of the window and its address.
+inline std::atomic<std::uint64_t> gfx_wait_ns{0}, gfx_waits{0}, asc_wait_ns{0}, asc_waits{0},
+    longest_wait_ns{0}, longest_wait_addr{0};
+/// Wall time the GPU command thread cycled through queues that were all waiting (ns), and the
+/// part of it spent asleep (BB_GPU_WAIT_SLEEP_US).
+inline std::atomic<std::uint64_t> queue_spin_ns{0}, queue_sleep_ns{0};
+inline void NoteQueueWait(std::atomic<std::uint64_t>& total, std::atomic<std::uint64_t>& count,
+                          std::chrono::steady_clock::time_point start, std::uint64_t addr) {
+    const std::uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - start).count();
+    total.fetch_add(ns, std::memory_order_relaxed);
+    count.fetch_add(1, std::memory_order_relaxed);
+    if (ns > longest_wait_ns.load(std::memory_order_relaxed)) {
+        longest_wait_ns.store(ns, std::memory_order_relaxed);
+        longest_wait_addr.store(addr, std::memory_order_relaxed);
+    }
+}
 /// Draws recorded into the reduced scene targets, and draws after the scene started.
 inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// Wall time spent blocked in the scheduler (ns): waiting for the recording thread to drain,

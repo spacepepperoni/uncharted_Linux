@@ -122,6 +122,10 @@ public:
     /// overlapping it is dirty, not only one starting at the address (copies moving textures).
     void InvalidateMemoryFromGPU(VAddr address, size_t max_size, bool whole_range = false);
 
+    /// bbport: after the button prompts switched between the game's pictures, the keyboard's and
+    /// Xbox, the button prompt pictures are uploaded again (button_prompts.h). GPU thread, once per submission.
+    void UpdateButtonPrompts();
+
     /// Evicts any images that overlap the unmapped range.
     void UnmapMemory(VAddr cpu_addr, size_t size);
 
@@ -427,9 +431,10 @@ private:
     Common::SlotVector<ImageView> slot_image_views;
     tsl::robin_map<u64, Sampler> samplers;
     std::unordered_set<ImageId> download_images;
-    std::unordered_set<ImageId> small_download_images; ///< bbport: ReadbackSmallTargets
     u64 total_used_memory = 0;
     u64 registered_image_bytes = 0; ///< bbport: guest bytes of registered images (diagnostics)
+    bool tight_budget = false;                  ///< bbport: card under ~5 GB
+    std::atomic<u64> pending_free_bytes{0};     ///< bbport: deleted, not yet destroyed
     u64 gc_evictions = 0, gc_downloads = 0, gc_dropped = 0; ///< bbport: pressure report
     u64 gc_kept = 0, gc_kept_bytes = 0; ///< bbport: old images the latest pass could not evict
     std::chrono::steady_clock::time_point gc_report_time{};
@@ -447,6 +452,11 @@ private:
     Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
     Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
     const bool readback_linear_images;
+    /// bbport: tiny render results (a few pixels) the game reads on the CPU, copied back to
+    /// guest memory without waiting (TinyReadback).
+    std::unordered_set<ImageId> tiny_download_images;
+    /// bbport: whether the image is such a result: at most 4x4 pixels, linear or 1x1.
+    [[nodiscard]] static bool TinyReadback(const Image& image);
     PageTable page_table;
     std::mutex mutex;
     /// gow3 (#138): under `mutex`. GPU-modified images hold the written data themselves.
@@ -473,6 +483,7 @@ private:
     };
     std::array<FindImageCacheEntry, 1024> find_image_cache{};
     std::atomic<u64> registry_generation{0};
+    u32 button_prompt_switches = 0;
     std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {
