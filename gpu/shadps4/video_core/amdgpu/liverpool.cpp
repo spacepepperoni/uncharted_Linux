@@ -44,6 +44,17 @@ static std::chrono::microseconds SubmitDelay() {
     return delay;
 }
 
+// bbport test: BB_GPU_WAIT_SLEEP_US=<us> sleeps that long once every queue has stayed waiting on
+// memory for a while, instead of cycling through them (a CPU thread at 100% that the Deck's
+// other emulator threads share a core with). 0 or unset: spin as before.
+static std::chrono::microseconds WaitSleep() {
+    static const std::chrono::microseconds sleep{[] {
+        const char* env = std::getenv("BB_GPU_WAIT_SLEEP_US");
+        return env ? std::strtoll(env, nullptr, 10) : 0LL;
+    }()};
+    return sleep;
+}
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -153,11 +164,34 @@ void Liverpool::Process(std::stop_token stoken) {
         VideoCore::StartCapture();
 
         curr_qid = -1;
+        // Queue visits since a task last finished: once past every queue, all are waiting.
+        u32 waiting_visits = 0;
+        std::chrono::steady_clock::time_point spin_start{};
+        const auto end_spin = [&] {
+            if (waiting_visits > num_mapped_queues) {
+                BbStats::queue_spin_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - spin_start).count(),
+                    std::memory_order_relaxed);
+            }
+            waiting_visits = 0;
+        };
 
         while (num_submits || num_commands) {
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
+            if (++waiting_visits == num_mapped_queues + 1) {
+                spin_start = std::chrono::steady_clock::now();
+            } else if (waiting_visits > 64 * num_mapped_queues && curr_qid == 0 &&
+                       WaitSleep().count()) {
+                const auto sleep_start = std::chrono::steady_clock::now();
+                std::this_thread::sleep_for(WaitSleep());
+                BbStats::queue_sleep_ns.fetch_add(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - sleep_start).count(),
+                    std::memory_order_relaxed);
+            }
 
             auto& queue = mapped_queues[curr_qid];
 
@@ -180,6 +214,7 @@ void Liverpool::Process(std::stop_token stoken) {
             task.resume();
 
             if (task.done()) {
+                end_spin();
                 task.destroy();
 
                 std::scoped_lock lock{queue.m_access};
@@ -1388,8 +1423,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
-                    while (!mem_semaphore->Signaled()) {
-                        YIELD_GFX();
+                    if (!mem_semaphore->Signaled()) {
+                        const auto wait_start = std::chrono::steady_clock::now();
+                        while (!mem_semaphore->Signaled()) {
+                            YIELD_GFX();
+                        }
+                        BbStats::NoteQueueWait(BbStats::gfx_wait_ns, BbStats::gfx_waits, wait_start,
+                                               mem_semaphore->Address<VAddr>());
                     }
                     mem_semaphore->Decrement();
                 }
@@ -1436,12 +1476,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 }
                 // Else the value may come from a fence that thread has yet to write: let it
                 // catch up before yielding to other queues.
-                while (!wait_reg_mem->Test(regs.reg_array)) {
-                    if (rasterizer && !rasterizer->DrawPipeIdle()) {
-                        rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
-                        continue;
+                if (!wait_reg_mem->Test(regs.reg_array)) {
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    while (!wait_reg_mem->Test(regs.reg_array)) {
+                        if (rasterizer && !rasterizer->DrawPipeIdle()) {
+                            rasterizer->DrainDrawPipe(static_cast<u32>(opcode));
+                            continue;
+                        }
+                        YIELD_GFX();
                     }
-                    YIELD_GFX();
+                    BbStats::NoteQueueWait(BbStats::gfx_wait_ns, BbStats::gfx_waits, wait_start,
+                                           wait_reg_mem->Address<VAddr>());
                 }
                 break;
             }
@@ -1809,8 +1854,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
-                while (!mem_semaphore->Signaled()) {
-                    YIELD_ASC(vqid);
+                if (!mem_semaphore->Signaled()) {
+                    const auto wait_start = std::chrono::steady_clock::now();
+                    while (!mem_semaphore->Signaled()) {
+                        YIELD_ASC(vqid);
+                    }
+                    BbStats::NoteQueueWait(BbStats::asc_wait_ns, BbStats::asc_waits, wait_start,
+                                           mem_semaphore->Address<VAddr>());
                 }
                 mem_semaphore->Decrement();
             }
@@ -1819,8 +1869,13 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
-            while (!wait_reg_mem->Test(regs.reg_array)) {
-                YIELD_ASC(vqid);
+            if (!wait_reg_mem->Test(regs.reg_array)) {
+                const auto wait_start = std::chrono::steady_clock::now();
+                while (!wait_reg_mem->Test(regs.reg_array)) {
+                    YIELD_ASC(vqid);
+                }
+                BbStats::NoteQueueWait(BbStats::asc_wait_ns, BbStats::asc_waits, wait_start,
+                                       wait_reg_mem->Address<VAddr>());
             }
             break;
         }
