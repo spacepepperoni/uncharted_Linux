@@ -130,6 +130,24 @@ inline std::atomic<std::uint64_t> gfx_wait_ns{0}, gfx_waits{0}, asc_wait_ns{0}, 
 /// Wall time the GPU command thread cycled through queues that were all waiting (ns), and the
 /// part of it spent asleep (BB_GPU_WAIT_SLEEP_US).
 inline std::atomic<std::uint64_t> queue_spin_ns{0}, queue_sleep_ns{0};
+/// The last label writes the GPU emulation made (fences, WriteData), and the graphics queue's
+/// waits that such a write ended (the rest ended by the guest's CPU code).
+inline std::atomic<std::uint64_t> fence_writes[256];
+inline std::atomic<std::uint32_t> fence_write_pos{0};
+inline std::atomic<std::uint64_t> gfx_fence_wait_ns{0}, gfx_fence_waits{0};
+inline void NoteFenceWrite(std::uint64_t addr) {
+    fence_writes[fence_write_pos.fetch_add(1, std::memory_order_relaxed) & 255].store(
+        addr, std::memory_order_relaxed);
+}
+inline bool RecentFenceWrite(std::uint64_t addr) {
+    for (const auto& write : fence_writes) {
+        const std::uint64_t written = write.load(std::memory_order_relaxed);
+        if (written && addr >= written && addr < written + 8) {
+            return true;
+        }
+    }
+    return false;
+}
 inline void NoteQueueWait(std::atomic<std::uint64_t>& total, std::atomic<std::uint64_t>& count,
                           std::chrono::steady_clock::time_point start, std::uint64_t addr) {
     const std::uint64_t ns = std::chrono::duration_cast<std::chrono::nanoseconds>(

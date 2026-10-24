@@ -471,10 +471,14 @@ void VideoOutDriver::Flip(const Request& req) {
             // Command queues waiting on memory, as a share of the window (GPU command thread).
             const u64 gfx_waits = BbStats::gfx_waits.exchange(0);
             const u64 asc_waits = BbStats::asc_waits.exchange(0);
-            std::printf("Queue waits: graphics %.1f%% (%.0f/frame), compute %.1f%% (%.0f/frame); all "
+            const u64 gfx_fence_waits = BbStats::gfx_fence_waits.exchange(0);
+            std::printf("Queue waits: graphics %.1f%% (%.0f/frame; on GPU emulation labels %.1f%%, "
+                        "%.0f/frame), compute %.1f%% (%.0f/frame); all "
                         "queues waiting %.1f%%, asleep %.1f%%; longest %.2f ms at 0x%llx\n",
                         BbStats::gfx_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(gfx_waits) / frames : 0.0,
+                        BbStats::gfx_fence_wait_ns.exchange(0) / (window * 1e7),
+                        frames ? double(gfx_fence_waits) / frames : 0.0,
                         BbStats::asc_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(asc_waits) / frames : 0.0,
                         BbStats::queue_spin_ns.exchange(0) / (window * 1e7),

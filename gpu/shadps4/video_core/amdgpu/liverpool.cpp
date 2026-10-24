@@ -312,6 +312,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
         [](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
+            BbStats::NoteFenceWrite(reinterpret_cast<u64>(address));
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 memcpy(address, &data, num_bytes);
             }
@@ -411,6 +412,7 @@ void SignalComputeFence(const ComputeFence& fence) {
     if (num_bytes) {
         void* address = release_mem.Address<void*>();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
+        BbStats::NoteFenceWrite(reinterpret_cast<u64>(address));
         if (!Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes)) {
             std::memcpy(address, &data, num_bytes);
         }
@@ -509,6 +511,7 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
+    BbStats::NoteFenceWrite(write_data->Address<u64>());
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
     std::memcpy(write_data->Address<u64*>(), write_data->data,
@@ -534,6 +537,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto write = [](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
+        BbStats::NoteFenceWrite(reinterpret_cast<u64>(address));
         if (!memory->TryWriteBacking(address, &value, num_bytes)) {
             memcpy(address, &value, num_bytes);
         }
@@ -1487,6 +1491,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     }
                     BbStats::NoteQueueWait(BbStats::gfx_wait_ns, BbStats::gfx_waits, wait_start,
                                            wait_reg_mem->Address<VAddr>());
+                    // Ended by a label the GPU emulation wrote, or by the guest's CPU code.
+                    if (BbStats::RecentFenceWrite(wait_reg_mem->Address<VAddr>())) {
+                        BbStats::gfx_fence_wait_ns.fetch_add(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - wait_start).count(),
+                            std::memory_order_relaxed);
+                        BbStats::gfx_fence_waits.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
                 break;
             }
