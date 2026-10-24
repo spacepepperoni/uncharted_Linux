@@ -55,6 +55,18 @@ static std::chrono::microseconds WaitSleep() {
     return sleep;
 }
 
+// bbport test: BB_FENCE_SHORTCUT=1 also counts as written the fences the draw recording thread has
+// passed but whose label is still to be written (after the GPU work and its copies to guest
+// memory: SignalAfterHostCopies), and compute queue fences, so a graphics WaitRegMem on them goes
+// on in stream order instead of waiting for the GPU (Uncharted 2: 25-45 ms each frame).
+static bool FenceShortcut() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_FENCE_SHORTCUT");
+        return env && env[0] == '1';
+    }();
+    return enabled;
+}
+
 static const char* dcb_task_name{"DCB_TASK"};
 static const char* ccb_task_name{"CCB_TASK"};
 
@@ -312,7 +324,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
         [](void* address, u64 data, u32 num_bytes) {
             auto* memory = Core::Memory::Instance();
             BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
-            BbStats::NoteFenceWrite(reinterpret_cast<u64>(address));
+            BbStats::NoteFenceWrite(reinterpret_cast<u64>(address), BbStats::FenceEop);
             if (!memory->TryWriteBacking(address, &data, num_bytes)) {
                 memcpy(address, &data, num_bytes);
             }
@@ -412,7 +424,7 @@ void SignalComputeFence(const ComputeFence& fence) {
     if (num_bytes) {
         void* address = release_mem.Address<void*>();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &data, num_bytes, BbWriteLog::Fence);
-        BbStats::NoteFenceWrite(reinterpret_cast<u64>(address));
+        BbStats::NoteFenceWrite(reinterpret_cast<u64>(address), BbStats::FenceCompute);
         if (!Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes)) {
             std::memcpy(address, &data, num_bytes);
         }
@@ -511,7 +523,7 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     VideoCore::LandingGate::Wait(VideoCore::LandingGate::Pending());
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
-    BbStats::NoteFenceWrite(write_data->Address<u64>());
+    BbStats::NoteFenceWrite(write_data->Address<u64>(), BbStats::FenceWriteData);
     BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
                      (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
     std::memcpy(write_data->Address<u64*>(), write_data->data,
@@ -537,7 +549,7 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto write = [](void* address, u64 value, u32 num_bytes) {
         auto* memory = Core::Memory::Instance();
         BbWriteLog::Note(reinterpret_cast<u64>(address), &value, num_bytes, BbWriteLog::Fence);
-        BbStats::NoteFenceWrite(reinterpret_cast<u64>(address));
+        BbStats::NoteFenceWrite(reinterpret_cast<u64>(address), BbStats::FenceEos);
         if (!memory->TryWriteBacking(address, &value, num_bytes)) {
             memcpy(address, &value, num_bytes);
         }
@@ -562,14 +574,13 @@ void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
 
 void Liverpool::NotePendingFences(const auto& event) {
     const u64 position = rasterizer->DrawPipeHead();
-    while (!pending_fences.empty() && rasterizer->DrawPipeReached(pending_fences.front().position)) {
-        pending_fences.pop_front();
-    }
+    DropWrittenFences();
     constexpr bool is_eop = requires { event.SignalFence([](void*, u64, u32) {}, [] {}); };
     const auto note = [&](void* address, u64 data, u32 num_bytes) {
         BbWriteLog::NoteIntent(reinterpret_cast<u64>(address), &data, num_bytes,
                                is_eop ? BbWriteLog::FenceIntent : BbWriteLog::EosIntent);
-        pending_fences.push_back({reinterpret_cast<VAddr>(address), data, num_bytes, position});
+        pending_fences.push_back({reinterpret_cast<VAddr>(address), data, num_bytes, position,
+                                  BbStats::fence_write_pos.load(std::memory_order_acquire)});
         rasterizer->NotePendingGpuWrite(reinterpret_cast<VAddr>(address), num_bytes);
     };
     if constexpr (requires { event.SignalFence(note, [] {}); }) {
@@ -585,13 +596,41 @@ void Liverpool::NotePendingWrite(const PM4CmdWriteData& write_data, u32 num_byte
     }
     u64 data = 0;
     std::memcpy(&data, write_data.data, num_bytes);
-    pending_fences.push_back(
-        {write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead()});
+    pending_fences.push_back({write_data.Address<VAddr>(), data, num_bytes, rasterizer->DrawPipeHead(),
+                              BbStats::fence_write_pos.load(std::memory_order_acquire)});
+}
+
+void Liverpool::DropWrittenFences() {
+    while (!pending_fences.empty() && rasterizer->DrawPipeReached(pending_fences.front().position) &&
+           (!FenceShortcut() || pending_fences.size() > 256 ||
+            BbStats::FenceWrittenSince(pending_fences.front().address,
+                                       pending_fences.front().writes_before))) {
+        pending_fences.pop_front();
+    }
+}
+
+void Liverpool::NotePendingComputeFence(const PM4CmdReleaseMem& release_mem) {
+    u64 data = 0;
+    u32 num_bytes = 0;
+    if (release_mem.data_sel.Value() == DataSelect::Data32Low) {
+        data = release_mem.DataDWord();
+        num_bytes = sizeof(u32);
+    } else if (release_mem.data_sel.Value() == DataSelect::Data64) {
+        data = release_mem.DataQWord();
+        num_bytes = sizeof(u64);
+    } else {
+        return;
+    }
+    DropWrittenFences();
+    pending_fences.push_back({release_mem.Address<VAddr>(), data, num_bytes,
+                              rasterizer->DrawPipeHead(),
+                              BbStats::fence_write_pos.load(std::memory_order_acquire)});
 }
 
 bool Liverpool::PendingFenceValue(VAddr address, u32& value) {
     for (auto it = pending_fences.rbegin(); it != pending_fences.rend(); ++it) {
-        if (rasterizer->DrawPipeReached(it->position)) {
+        if (rasterizer->DrawPipeReached(it->position) &&
+            (!FenceShortcut() || BbStats::FenceWrittenSince(it->address, it->writes_before))) {
             break; // written already: memory holds it (or a later write)
         }
         if (address >= it->address && address + sizeof(u32) <= it->address + it->num_bytes) {
@@ -1492,12 +1531,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     BbStats::NoteQueueWait(BbStats::gfx_wait_ns, BbStats::gfx_waits, wait_start,
                                            wait_reg_mem->Address<VAddr>());
                     // Ended by a label the GPU emulation wrote, or by the guest's CPU code.
-                    if (BbStats::RecentFenceWrite(wait_reg_mem->Address<VAddr>())) {
-                        BbStats::gfx_fence_wait_ns.fetch_add(
+                    if (const auto kind = BbStats::RecentFenceWrite(wait_reg_mem->Address<VAddr>());
+                        kind != BbStats::FenceKinds) {
+                        BbStats::gfx_fence_wait_ns[kind].fetch_add(
                             std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - wait_start).count(),
                             std::memory_order_relaxed);
-                        BbStats::gfx_fence_waits.fetch_add(1, std::memory_order_relaxed);
+                        BbStats::gfx_fence_waits[kind].fetch_add(1, std::memory_order_relaxed);
                     }
                 }
                 break;
@@ -1897,6 +1937,9 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 if (fence_packet->data_sel.Value() != DataSelect::GdsMemStore) {
                     const ComputeFence fence{*fence_packet, queue.pipe_id};
                     rasterizer->RunInOrder(&RunComputeReleaseMem, &fence, sizeof(fence));
+                    if (FenceShortcut()) {
+                        NotePendingComputeFence(*fence_packet);
+                    }
                     break;
                 }
                 rasterizer->DrainDrawPipe(static_cast<u32>(opcode));

@@ -130,19 +130,43 @@ inline std::atomic<std::uint64_t> gfx_wait_ns{0}, gfx_waits{0}, asc_wait_ns{0}, 
 /// Wall time the GPU command thread cycled through queues that were all waiting (ns), and the
 /// part of it spent asleep (BB_GPU_WAIT_SLEEP_US).
 inline std::atomic<std::uint64_t> queue_spin_ns{0}, queue_sleep_ns{0};
-/// The last label writes the GPU emulation made (fences, WriteData), and the graphics queue's
-/// waits that such a write ended (the rest ended by the guest's CPU code).
+/// The last label writes the GPU emulation made (fences, WriteData) with their kind and order,
+/// and the graphics queue's waits such a write ended, by kind (the rest the guest's CPU code ended).
+enum FenceKind : std::uint32_t { FenceEop, FenceEos, FenceWriteData, FenceCompute, FenceKinds };
 inline std::atomic<std::uint64_t> fence_writes[256];
-inline std::atomic<std::uint32_t> fence_write_pos{0};
-inline std::atomic<std::uint64_t> gfx_fence_wait_ns{0}, gfx_fence_waits{0};
-inline void NoteFenceWrite(std::uint64_t addr) {
-    fence_writes[fence_write_pos.fetch_add(1, std::memory_order_relaxed) & 255].store(
-        addr, std::memory_order_relaxed);
+inline std::atomic<std::uint32_t> fence_write_kinds[256];
+inline std::atomic<std::uint64_t> fence_write_seqs[256];
+inline std::atomic<std::uint64_t> fence_write_pos{0};
+inline std::atomic<std::uint64_t> gfx_fence_wait_ns[FenceKinds], gfx_fence_waits[FenceKinds];
+inline void NoteFenceWrite(std::uint64_t addr, FenceKind kind) {
+    const std::uint64_t seq = fence_write_pos.fetch_add(1, std::memory_order_relaxed);
+    fence_writes[seq & 255].store(addr, std::memory_order_relaxed);
+    fence_write_kinds[seq & 255].store(kind, std::memory_order_relaxed);
+    fence_write_seqs[seq & 255].store(seq, std::memory_order_release);
 }
-inline bool RecentFenceWrite(std::uint64_t addr) {
-    for (const auto& write : fence_writes) {
-        const std::uint64_t written = write.load(std::memory_order_relaxed);
-        if (written && addr >= written && addr < written + 8) {
+/// The kind of the latest recent write to the label at addr, or FenceKinds when there is none.
+inline FenceKind RecentFenceWrite(std::uint64_t addr) {
+    std::uint64_t newest = 0;
+    FenceKind kind = FenceKinds;
+    for (int i = 0; i < 256; ++i) {
+        const std::uint64_t written = fence_writes[i].load(std::memory_order_relaxed);
+        const std::uint64_t seq = fence_write_seqs[i].load(std::memory_order_acquire);
+        if (written && addr >= written && addr < written + 8 && (kind == FenceKinds || seq > newest)) {
+            newest = seq;
+            kind = static_cast<FenceKind>(fence_write_kinds[i].load(std::memory_order_relaxed));
+        }
+    }
+    return kind;
+}
+/// Whether the label at addr was written since write number `since` (or too long ago to tell).
+inline bool FenceWrittenSince(std::uint64_t addr, std::uint64_t since) {
+    if (fence_write_pos.load(std::memory_order_acquire) - since >= 256) {
+        return true;
+    }
+    for (int i = 0; i < 256; ++i) {
+        const std::uint64_t written = fence_writes[i].load(std::memory_order_relaxed);
+        if (written && addr >= written && addr < written + 8 &&
+            fence_write_seqs[i].load(std::memory_order_acquire) >= since) {
             return true;
         }
     }

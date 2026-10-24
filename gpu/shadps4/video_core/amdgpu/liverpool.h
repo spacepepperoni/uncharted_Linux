@@ -78,8 +78,11 @@ struct Liverpool {
         u64 data;
         u32 num_bytes;
         u64 position;
+        u64 writes_before; ///< BbStats::fence_write_pos when noted (BB_FENCE_SHORTCUT)
     };
     std::deque<PendingFence> pending_fences;
+    void DropWrittenFences();
+    void NotePendingComputeFence(const struct PM4CmdReleaseMem& release_mem);
     void NotePendingFences(const auto& event);
     bool PendingFenceValue(VAddr address, u32& value);
     void NotePendingWrite(const struct PM4CmdWriteData& write_data, u32 num_bytes);
