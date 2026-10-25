@@ -11,6 +11,7 @@ on:
       - '**.md'
       - 'docs/**'
       - '.github/workflows/sync-upstream.yml'
+      - '.github/workflows/build.yml'  # tested by its pull request; no new release on its own
   pull_request:
     paths-ignore:
       - '**.md'
@@ -75,6 +76,18 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           apt-get install -yq --no-install-recommends gh >/dev/null
+          # The sync workflow's merges of upstream get their notes here, with a link to upstream's
+          # release; a merged pull request's notes are written by hand afterwards.
+          version=${TAG#v}; version=${version%-linux.*}
+          NOTES="Built from $(git log -1 --format='%h %s')."
+          if [ "$(git log -1 --format=%an)" = 'github-actions[bot]' ]; then
+            upstream=https://github.com/Supermedo/uncharted_pc/releases
+            if gh release view "v$version" --repo Supermedo/uncharted_pc >/dev/null 2>&1; then
+              upstream="$upstream/tag/v$version"
+            fi
+            NOTES="Merged upstream $version
+
+          Upstream release notes: $upstream"
+          fi
           gh release create "$TAG" dist/Uncharted-x86_64.AppImage dist/uncharted-linux.tar.gz --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" --title "Uncharted for Linux/Steam Deck $TAG" \
-            --notes "Built from $(git log -1 --format='%h %s'). Install steps: see the README."
+            --target "$GITHUB_SHA" --title "$TAG" --notes "$NOTES"
