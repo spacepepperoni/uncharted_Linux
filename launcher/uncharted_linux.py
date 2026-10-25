@@ -1283,9 +1283,6 @@ def launcher_class(base, ns):
             if name == 'display':
                 title, subtitle = _('Settings'), _('Display, graphics and the console.')
             f = super().page(name, title, subtitle)
-            if not subtitle:  # the heading's empty second line (page body -> canvas -> body -> shell)
-                head = f.master.master.master.winfo_children()[0]
-                head.winfo_children()[1].pack_forget()
             self.page_inner = getattr(self, 'page_inner', {})
             self.page_inner[name] = f
             if name == 'display':
