@@ -13,6 +13,7 @@
 #include "bbport_copy.h"
 #include "bbport_toggles.h"
 #include "common/thread.h"
+#include "video_core/chained_writes.h"
 #include "video_core/landing_gate.h"
 #include "common/alignment.h"
 #include "core/memory.h"
@@ -1520,6 +1521,10 @@ void BufferCache::CheckStableBindings() {
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 size,
                                                         bool is_written, bool is_texel_buffer) {
+    // Linux fork: a chained WriteData into this memory lands first (chained_writes.h).
+    if (ChainedWrites::MustWait(device_addr, size)) {
+        scheduler.WaitDeferredSignals();
+    }
     const bool stats = BufferStatsEnabled();
     if (stats) {
         PrintBufferStats();
@@ -1588,6 +1593,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
 }
 
 std::pair<const Buffer*, u64> BufferCache::ObtainBufferForImage(VAddr device_addr, u32 size) {
+    if (ChainedWrites::MustWait(device_addr, size)) {
+        scheduler.WaitDeferredSignals();
+    }
     if (IsRegionGpuModified(device_addr, size)) {
         return ObtainBuffer(device_addr, size, false);
     }

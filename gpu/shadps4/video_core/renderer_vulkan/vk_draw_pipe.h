@@ -12,6 +12,7 @@
 #pragma once
 
 #include <cstdlib>
+#include "video_core/chained_writes.h"
 #include "bbport_threads.h"
 
 #include <array>
@@ -167,6 +168,7 @@ private:
 
     void Run(std::stop_token stop) {
         Common::SetCurrentThreadName("bb:DrawRec");
+        VideoCore::ChainedWrites::AllowWait();
         on_stage_b = true;
         stage_b_tid.store(static_cast<u32>(gettid()), std::memory_order_release);
         u64 at = 0;

@@ -27,6 +27,8 @@
 #include "video_core/amdgpu/liverpool.h"
 #include "bbport_write_log.h"
 #include "video_core/amdgpu/pm4_cmds.h"
+#include <boost/container/small_vector.hpp>
+#include "video_core/chained_writes.h"
 #include "video_core/landing_gate.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -137,6 +139,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    VideoCore::ChainedWrites::AllowWait();
     on_processor_thread = true;
 #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
@@ -500,9 +503,41 @@ void SignalFlip(Vulkan::Rasterizer& rasterizer, const u8*) {
     Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxFlip);
 }
 
+// Linux fork: on the draw recording thread a WriteData goes behind the fences deferred before it
+// (SignalAfterHostCopies) instead of waiting for them here: the guest sees it in the same order,
+// and the recording thread goes on (Uncharted 2's convoy on the Steam Deck: a third of its time
+// waited here; 21.8 -> 25.9 FPS). GPU work recorded before the write lands that reads its memory
+// waits for it (chained_writes.h). BB_CHAIN_WRITEDATA=0 waits as before.
+static bool ChainWriteData() {
+    static const bool enabled = [] {
+        const char* env = std::getenv("BB_CHAIN_WRITEDATA");
+        return !env || env[0] != '0';
+    }();
+    return enabled;
+}
+
 void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
+    if (ChainWriteData() && Vulkan::DrawPipe::OnStageB() &&
+        !BbToggle::Disabled(BbToggle::RecorderFences)) {
+        const u64 address = write_data->Address<u64>();
+        const size_t size = (header->type3.count.Value() - 2) * sizeof(u32);
+        boost::container::small_vector<u32, 8> words(write_data->data, write_data->data + size / 4);
+        rasterizer.GetBufferCache().CheckStableBindings();
+        rasterizer.CheckConstants();
+        // Draws recorded before it lands that read this memory wait for it (chained_writes.h).
+        auto landed = VideoCore::ChainedWrites::Add(address, size);
+        rasterizer.SignalAfterHostCopies(
+            [address, size, words = std::move(words), landed = std::move(landed)] {
+                BbStats::NoteFenceWrite(address, BbStats::FenceWriteData);
+                BbWriteLog::Note(address, words.data(), size, BbWriteLog::WriteData);
+                std::memcpy(reinterpret_cast<void*>(address), words.data(), size);
+                VideoCore::ChainedWrites::Landed(landed);
+            },
+            VideoCore::LandingGate::Pending());
+        return;
+    }
     // Copies deferred to the recording thread, and fences deferred to it (RecorderFences),
     // precede writes the guest sees.
     rasterizer.WaitHostCopies();
