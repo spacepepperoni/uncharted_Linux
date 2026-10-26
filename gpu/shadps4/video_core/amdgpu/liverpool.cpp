@@ -243,9 +243,21 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
+        // Linux fork: new work that comes in meanwhile is processed first (the guest submits a
+        // few hundred times a frame; waiting here held each one back): idle is reported once the
+        // GPU really is idle with every label written. BB_IDLE_WAIT_YIELD=0 waits as before.
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
-            rasterizer->WaitDeferredSignals();
+            static const bool yield_to_work = [] {
+                const char* env = std::getenv("BB_IDLE_WAIT_YIELD");
+                return !env || env[0] != '0';
+            }();
+            if (!yield_to_work) {
+                rasterizer->WaitDeferredSignals();
+            } else if (!rasterizer->WaitDeferredSignalsUnless(
+                           [this] { return num_submits.load() != 0 || num_commands.load() != 0; })) {
+                continue;
+            }
         }
         {
             std::scoped_lock lk{submit_mutex};
@@ -519,12 +531,20 @@ static bool ChainWriteData() {
 void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto* header = reinterpret_cast<const PM4Header*>(data);
     const auto* write_data = reinterpret_cast<const PM4CmdWriteData*>(data);
+    const u64 address = write_data->Address<u64>();
+    const size_t size = (header->type3.count.Value() - 2) * sizeof(u32);
+    // Only into a page the caches do not watch (the guest's copy is already newer than any GPU
+    // copy): the write lands on the Vulkan recording thread, where a write fault on a watched
+    // page would wait for the GPU command thread while that waits for the recording thread (a
+    // hang loading Uncharted 2's convoy). Watched pages take the waiting path below.
+    auto& buffer_cache = rasterizer.GetBufferCache();
     if (ChainWriteData() && Vulkan::DrawPipe::OnStageB() &&
-        !BbToggle::Disabled(BbToggle::RecorderFences)) {
-        const u64 address = write_data->Address<u64>();
-        const size_t size = (header->type3.count.Value() - 2) * sizeof(u32);
+        !BbToggle::Disabled(BbToggle::RecorderFences) && size != 0 &&
+        (address & ~u64(4095)) == ((address + size - 1) & ~u64(4095)) &&
+        buffer_cache.IsRegionCpuModified(address, size) &&
+        !buffer_cache.IsRegionGpuModified(address, size)) {
         boost::container::small_vector<u32, 8> words(write_data->data, write_data->data + size / 4);
-        rasterizer.GetBufferCache().CheckStableBindings();
+        buffer_cache.CheckStableBindings();
         rasterizer.CheckConstants();
         // Draws recorded before it lands that read this memory wait for it (chained_writes.h).
         auto landed = VideoCore::ChainedWrites::Add(address, size);
@@ -532,7 +552,11 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
             [address, size, words = std::move(words), landed = std::move(landed)] {
                 BbStats::NoteFenceWrite(address, BbStats::FenceWriteData);
                 BbWriteLog::Note(address, words.data(), size, BbWriteLog::WriteData);
-                std::memcpy(reinterpret_cast<void*>(address), words.data(), size);
+                // Through the backing like the fences (SignalEop): never a fault on this thread.
+                auto* memory = Core::Memory::Instance();
+                if (!memory->TryWriteBacking(reinterpret_cast<void*>(address), words.data(), size)) {
+                    std::memcpy(reinterpret_cast<void*>(address), words.data(), size);
+                }
                 VideoCore::ChainedWrites::Landed(landed);
             },
             VideoCore::LandingGate::Pending());
@@ -546,10 +570,8 @@ void RunWriteData(Vulkan::Rasterizer& rasterizer, const u8* data) {
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
     BbStats::NoteFenceWrite(write_data->Address<u64>(), BbStats::FenceWriteData);
-    BbWriteLog::Note(write_data->Address<u64>(), write_data->data,
-                     (header->type3.count.Value() - 2) * sizeof(u32), BbWriteLog::WriteData);
-    std::memcpy(write_data->Address<u64*>(), write_data->data,
-                (header->type3.count.Value() - 2) * sizeof(u32));
+    BbWriteLog::Note(address, write_data->data, size, BbWriteLog::WriteData);
+    std::memcpy(reinterpret_cast<void*>(address), write_data->data, size);
 }
 
 void RunEventWriteEos(Vulkan::Rasterizer& rasterizer, const u8* data) {
