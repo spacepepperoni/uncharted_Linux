@@ -243,21 +243,9 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
-        // Linux fork: new work that comes in meanwhile is processed first (the guest submits a
-        // few hundred times a frame; waiting here held each one back): idle is reported once the
-        // GPU really is idle with every label written. BB_IDLE_WAIT_YIELD=0 waits as before.
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
-            static const bool yield_to_work = [] {
-                const char* env = std::getenv("BB_IDLE_WAIT_YIELD");
-                return !env || env[0] != '0';
-            }();
-            if (!yield_to_work) {
-                rasterizer->WaitDeferredSignals();
-            } else if (!rasterizer->WaitDeferredSignalsUnless(
-                           [this] { return num_submits.load() != 0 || num_commands.load() != 0; })) {
-                continue;
-            }
+            rasterizer->WaitDeferredSignals();
         }
         {
             std::scoped_lock lk{submit_mutex};
