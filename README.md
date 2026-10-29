@@ -4,8 +4,8 @@
 
 **Uncharted 1, 2 and 3 from the PS4 collection running natively on Linux, forked by spacepepperoni from [SuperMedo](https://github.com/Supermedo).**
 
-**This client is a launcher that allows you to directly launch Uncharted 1-3, add to your desktop or add to your Steam Library. This fork features auto-updates, a modified save system and a Steam Deck mode that optimizes playback for Steam Deck.**
-<img width="2568" height="1675" alt="image" src="https://github.com/user-attachments/assets/4b519fd9-af3f-4118-b37d-2ff2469cc5b6" />
+**This launcher allows you to play Uncharted 1-3 by direct launch as well as desktop/steam shortcuts. This release also contains a Steam Deck mode that optimizes the games to run on Steam Deck.**
+<img width="1316" height="809" alt="image" src="https://github.com/user-attachments/assets/0e9cf5c1-2094-465f-b1b5-98d5575e88fe" />
 
 ## Distributions tested
 ✅ Confirmed Working: SteamOS 3.7, Fedora 44, Debian 13 CachyOS, Arch, openSUSE Tumbleweed, Ubuntu 24.04, Mint 22, Pop!OS 24.04
@@ -21,7 +21,7 @@
 
 This client ships with a built in updater that can be toggled on/off, and updates from two sources: the main repo & this fork. 
 
-- If opening the launcher itself, you'll see available updates in the bottom left of the launcher.
+- In the launcher itself, you'll see available updates in the bottom left of the launcher.
 <img width="400" height="98" alt="image" src="https://github.com/user-attachments/assets/911e9ded-29b0-465b-8c18-5f589e987063" />
 
 - If launching one of the games through Steam or Game Mode (Steam Deck), you will be prompted with an update screen if one is available.
@@ -30,10 +30,11 @@ This client ships with a built in updater that can be toggled on/off, and update
 
 ## Steam Deck
 
-<img width="1316" height="809" alt="image" src="https://github.com/user-attachments/assets/0e9cf5c1-2094-465f-b1b5-98d5575e88fe" />
-
-- For Steam Deck, it is recommended to install the [.AppImage](https://github.com/spacepepperoni/uncharted_Linux/releases/latest/download/Uncharted-x86_64.AppImage) and add the games to Steam to play in Game Mode. 
-- In the Display tab, a Steam Deck mode is auto-selected if you are on SteamOS. With this enabled, expect an average of 25-30fps with occasional dips during demanding segments.
+- Download the [.AppImage](https://github.com/spacepepperoni/uncharted_Linux/releases/latest/download/Uncharted-x86_64.AppImage) and add the games to Steam to play in Game Mode.
+- Adding the games to your Steam Library grabs the cover art from SteamGridDB
+- In the Settings tab, a Steam Deck mode is auto-selected if you are on SteamOS. With this enabled, expect an average of 25-30fps with occasional dips during demanding segments.
+- Steam Deck mode automatically enables Steam Controller buttons
+  <img width="1280" height="800" alt="image" src="https://github.com/user-attachments/assets/b63d118c-b9ed-46ac-b3d7-fc739cf927b6" />
 - It is recommended to set your FPS cap to 30fps and set Manual GPU Clock to 1300mhz.
 
 ## Files needed 
