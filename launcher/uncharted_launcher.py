@@ -200,7 +200,7 @@ FIXES = {
          'off': {'BB_SCALAR_COPY64_SYNC': '0', 'BB_SCALAR_COPY64_DEFER': '0'}}),
     'fix_tiny_readback': (
         'Aim and turret focus (Uncharted 2 and 3)',
-        'Enemies stay in focus when aiming. Automatic: on in Uncharted 2 and 3; in Uncharted 1 it costs about 13%.',
+        'Enemies stay in focus when aiming. Automatic: on in Uncharted 2 and 3; it can cost about 13% of the frame rate.',
         {'on': {'BB_TINY_READBACK': '1'}, 'off': {'BB_TINY_READBACK': '0'}}),
     'fix_small_buffers': (
         'Brightness flicker fix',
