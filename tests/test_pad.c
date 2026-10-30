@@ -116,12 +116,35 @@ int main(void) {
     SDL_UpdateJoysticks();
     SDL_UpdateGamepads();
     assert(pad_read_state(1,&data)==0 && data.touch_count==1 && data.touches[0].x==480);
+    /* Linux fork: a second gamepad; pressing a button on it makes it the one the game reads. */
+    assert(SDL_SetJoystickVirtualButton(joystick,SDL_GAMEPAD_BUTTON_TOUCHPAD,false));
+    assert(SDL_SetJoystickVirtualTouchpad(joystick,0,0,false,0,0,0));
+    SDL_VirtualJoystickDesc second=desc;
+    second.name="bbport second test controller";
+    second.ntouchpads=0;
+    second.touchpads=NULL;
+    SDL_JoystickID second_id=SDL_AttachVirtualJoystick(&second);
+    assert(second_id!=0);
+    SDL_Joystick *second_joystick=SDL_OpenJoystick(second_id);
+    assert(second_joystick);
+    SDL_UpdateJoysticks();
+    SDL_UpdateGamepads();
+    gamepads_listed_us=0;
+    assert(pad_read_state(1,&data)==0 && !(data.buttons & BTN_CROSS) && gamepad_count==2);
+    assert(SDL_SetJoystickVirtualButton(second_joystick,SDL_GAMEPAD_BUTTON_SOUTH,true));
+    SDL_UpdateJoysticks();
+    SDL_UpdateGamepads();
+    assert(pad_read_state(1,&data)==0 && (data.buttons & BTN_CROSS));
+    assert(gamepad && SDL_GetGamepadID(gamepad)==second_id);
+    SDL_CloseJoystick(second_joystick);
     SDL_CloseJoystick(joystick);
-    if (gamepad) SDL_CloseGamepad(gamepad);
+    for (int i=0;i<gamepad_count;++i) SDL_CloseGamepad(gamepads[i]);
+    gamepad_count=0;
     gamepad=NULL;
+    assert(SDL_DetachVirtualJoystick(second_id));
     assert(SDL_DetachVirtualJoystick(id));
     SDL_Quit();
     unlink(path);
     unlink(config);
-    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch, vibration controls, overlay capture");
+    puts("PASS: pad ABI, debug camera chord, left/right clicks, SDL touch, vibration controls, overlay capture, second gamepad");
 }
