@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 """Prepares an Uncharted executable of the Nathan Drake Collection and starts bb-probe.exe.
 
-BB_GAME_DIR   the game folder (CUSA02343, CUSA02320, ...; the one with eboot.bin)
+BB_GAME_DIR   the game folder (CUSA02343, CUSA02320, ...; the one with eboot.bin), or its fake
+              PKG: unpacked once beside it into <TITLE_ID>/ (scripts/pkg_extract.py)
 BB_GAME_DIR_U1 / _U2 / _U3   optional: the folder of a game that was dumped on its own; used for
               that game instead of BB_GAME_DIR (its executable may be that folder's eboot.bin)
 BB_EXE        u1 / u2 / u3 or an executable name (default u1: eboot.bin, the collection menu)
@@ -105,6 +106,27 @@ def split_saves(user_dir):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(entry), str(target))
             print(f'Saves: moved {entry.name} to {target.parent.name}/')
+
+
+def unpack_pkg(pkg):
+    """Linux fork: the game folder of a fake PKG, unpacked beside it on the first start (as in the
+    MediEvil port); later starts reuse the folder."""
+    import pkg_extract
+    target = Path(pkg_extract.default_target(pkg))
+    if not pkg_extract.is_extracted(pkg, target):
+        print(f'Unpacking {pkg.name} into {target} (first start only) ...', flush=True)
+        last = [-1]
+
+        def report(done, total, rate):
+            percent = done * 100 // max(total, 1)
+            if percent != last[0]:
+                last[0] = percent
+                print(f'PKG: {percent}% ({done >> 20} of {total >> 20} MB, {rate:.0f} MB/s)', flush=True)
+        try:
+            pkg_extract.extract(str(pkg), str(target), report)
+        except (OSError, ValueError) as error:
+            fail(f'Could not unpack {pkg}: {error}')
+    return target
 
 
 def executable_name(value):
@@ -387,6 +409,9 @@ def main():
             env['PATH'] = f'{clang64}{os.pathsep}{env.get("PATH", "")}'
 
     game_res(env)
+    pkg = Path(env.get('BB_GAME_DIR', ''))
+    if pkg.suffix.lower() == '.pkg' and pkg.is_file():
+        env['BB_GAME_DIR'] = str(unpack_pkg(pkg))
     exe = executable_name(env.get('BB_EXE', ''))
     user_dir = Path(env.get('BB_USER_DIR', data / 'user')).resolve()
     user_dir.mkdir(parents=True, exist_ok=True)
