@@ -11,11 +11,13 @@ import re
 from pathlib import Path
 import shutil
 import signal
+import struct
 import subprocess
 import sys
 import threading
 from types import SimpleNamespace
 import time
+import zlib
 
 import uncharted_logs
 
@@ -408,6 +410,7 @@ def apply_defaults(ns):
     """Linux settings the Windows launcher does not have: Steam Deck mode (on by default on
     SteamOS) and a 30 FPS frame rate."""
     ns['APP_DEFAULTS'].setdefault('steam_deck', steam_deck())
+    ns['APP_DEFAULTS'].setdefault('update_dir', '')  # the title update's folder (Files page)
     # No Fixes page: each fix stays automatic (run.py turns it on where it helps), whatever an
     # earlier version saved for it.
     for key, (title, hint, _choices) in ns['FIXES'].items():
@@ -480,6 +483,14 @@ def deck_allows(key, value):
     if key == 'frame_rate':
         return value in DECK_FRAME_RATES
     return value not in DECK_UNAVAILABLE.get(key, ())
+
+
+def update_environment(settings, env):
+    """The title update (1.02) as its own folder: run.py merges it over the game. Empty: the
+    <game folder>-UPDATE folder beside the game (shadPS4's layout), when there is one."""
+    folder = str(settings.get('update_dir') or '').strip()
+    if folder:
+        env['BB_GAME_UPDATE_DIR'] = folder
 
 
 def deck_environment(settings, env):
@@ -1179,8 +1190,12 @@ def launcher_class(base, ns):
             self.folder(f, 'game_dir', _('Game folder'), _('The folder with eboot.bin'),
                         _('The folder with eboot.bin, big2-ps4_Shipping.elf and big3-ps4_Shipping.elf.'),
                         on_change=self.refresh)
+            self.folder(f, 'update_dir', _('Update folder'), _('The folder of the game update (1.02)'),
+                        _('Optional: the game update (1.02) as its own folder. Empty: the folder named like the '
+                          'game folder with -UPDATE, when there is one beside it.'))
             self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'),
                         _('Empty: a Saves folder in the game folder.'))
+            self.build_pkg_install(f)
             self.section(f, _('Saves'))
             card = self.target(f)
             self.saves_rows = self.tk.Frame(card, bg=CARD)
@@ -1192,6 +1207,94 @@ def launcher_class(base, ns):
             holder = self.tk.Frame(card, bg=CARD)
             holder.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(12, 0))
             self.pill(holder, _('Clear shader cache'), self.clear_cache).pack(side='left')
+
+        def build_pkg_install(self, f):
+            """A fake PKG (fPKG) of the collection is unpacked once into <its folder>/<TITLE_ID>,
+            which becomes the game folder (scripts/pkg_extract.py, from the MediEvil port)."""
+            self.ttk.Style(self.root).configure('Horizontal.TProgressbar', background=GOLD, troughcolor=ns['CARD_HI'],
+                                 bordercolor=CARD, lightcolor=GOLD, darkcolor=GOLD)
+            holder = self.tk.Frame(self.target(f), bg=CARD)
+            self.pkg_button = self.pill(holder, _('Choose .pkg…'), self.choose_pkg, padding=(14, 6))
+            self.pkg_button.pack(side='left')
+            self.pkg_progress = self.ttk.Progressbar(holder, length=self.px(220), maximum=1000)
+            self.pkg_progress.pack(side='left', padx=(12, 0))
+            self.row(f, _('Install from PKG'), holder,
+                     _('Unpacks your fake PKG of the collection once (about 59 GB) next to the .pkg and '
+                       'fills in the game folder. An interrupted unpack continues where it stopped.'))
+            card = self.target(f)
+            self.pkg_label = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(560),
+                                            justify='left')
+            self.pkg_label.grid(row=self.next_row(card), column=1, sticky='w')
+            self.pkg_busy = False
+
+        def choose_pkg(self):
+            if self.pkg_busy:
+                return
+            last = self.app.get('last_pkg') or ''
+            chosen = self.filedialog.askopenfilename(
+                title=_('Choose the game .pkg'), filetypes=[(_('PS4 package'), '*.pkg'), (_('All files'), '*')],
+                initialdir=str(Path(last).parent) if last else str(Path.home()))
+            if chosen:
+                self.install_pkg(Path(chosen))
+
+        def install_pkg(self, path):
+            try:
+                import pkg_extract
+                pkg = pkg_extract.Pkg(str(path))
+                target = Path(pkg_extract.default_target(path))
+                if pkg_extract.is_extracted(path, target):
+                    self.var('game_dir').set(str(target))
+                    self.pkg_progress.configure(value=1000)
+                    self.pkg_label.configure(text=_('Already unpacked in {}.').format(target))
+                    return
+                pkg.load_fs()
+                items = list(pkg.walk())
+            except ImportError as error:
+                self.messagebox.showerror(NAME, _('Unpacking needs the Python package cryptography: {}').format(error))
+                return
+            except (OSError, ValueError, KeyError, struct.error) as error:
+                self.messagebox.showerror(NAME, _('This is not a PKG that can be unpacked: {}').format(error))
+                return
+            self.app['last_pkg'] = str(path)
+            size = sum(pkg.inodes[i]['size'] for _r, i, t in items if t == pkg_extract.PFS_FILE)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            free = shutil.disk_usage(target.parent).free
+            if not self.messagebox.askyesno(NAME, _(
+                    'Unpack {} into {}?\n\nThe game needs {:.1f} GB; free space on that drive: {:.1f} GB.').format(
+                        path.name, target, size / 2**30, free / 2**30)):
+                return
+            self.pkg_busy = True
+            self.pkg_button.configure(state='disabled')
+            self.refresh()
+            self.pkg_label.configure(text=_('Reading {}…').format(path.name))
+
+            def report(done, total, rate):
+                def show():
+                    self.pkg_progress.configure(value=done * 1000 // max(total, 1))
+                    self.pkg_label.configure(text=_('Unpacking: {:.1f} of {:.1f} GB ({:.0f} MB/s)').format(
+                        done / 2**30, total / 2**30, rate))
+                self.ui_calls.put(show)
+
+            def work():
+                error = None
+                try:
+                    pkg_extract.extract(pkg, str(target), report, items)
+                except (OSError, ValueError, zlib.error) as failure:
+                    error = failure
+
+                def done():
+                    self.pkg_busy = False
+                    self.pkg_button.configure(state='normal')
+                    if error:
+                        self.pkg_label.configure(text=_('Unpacking stopped: {}. Choose the .pkg again to continue.').format(error))
+                        self.messagebox.showerror(NAME, _('Could not unpack: {}').format(error))
+                    else:
+                        self.pkg_progress.configure(value=1000)
+                        self.pkg_label.configure(text=_('Installed in {}.').format(target))
+                        self.var('game_dir').set(str(target))
+                    self.refresh()
+                self.ui_calls.put(done)
+            threading.Thread(target=work, daemon=True).start()
 
         def row(self, parent, title, widget, hint=None):
             """Upstream's rows with this fork's shorter texts (ROW_HINTS; None: no text)."""
@@ -1400,7 +1503,8 @@ def launcher_class(base, ns):
             info = self.info
             for key, (play, steam, shortcut, note, exe) in getattr(self, 'game_rows', {}).items():
                 present = bool(info) and key in info['games']
-                play.configure(state='normal' if present and not self.process else 'disabled')
+                play.configure(state='normal' if present and not self.process and not getattr(self, 'pkg_busy', False)
+                               else 'disabled')
                 for button in (steam, shortcut):
                     button.configure(state='normal' if present else 'disabled')
                 if not info:

@@ -12,7 +12,7 @@ python=${PYTHON:-python3}
 if [[ ! -x out/pyenv/bin/python ]]; then
     "$python" -m venv out/pyenv
 fi
-out/pyenv/bin/python -m pip install -q --disable-pip-version-check pyinstaller pillow
+out/pyenv/bin/python -m pip install -q --disable-pip-version-check pyinstaller pillow cryptography
 [[ -f launcher/uncharted.png ]] || out/pyenv/bin/python - <<'EOF'
 from PIL import Image
 icon = Image.open('launcher/uncharted.ico')
@@ -20,7 +20,8 @@ icon.size = max(icon.ico.sizes())
 icon.convert('RGBA').save('launcher/uncharted.png')
 EOF
 hidden=()
-for module in argparse base64 collections hashlib json re shlex shutil struct tempfile zlib cheats xml.etree.ElementTree \
+for module in argparse base64 collections hashlib hmac json re shlex shutil struct tempfile zlib cheats xml.etree.ElementTree \
+              pkg_extract pkg_keys cryptography.hazmat.primitives.ciphers \
               uncharted_art uncharted_fonts uncharted_i18n uncharted_widgets uncharted_linux uncharted_logs bbport_steam PIL.ImageTk PIL._tkinter_finder; do
     hidden+=(--hidden-import "$module")
 done
@@ -63,7 +64,8 @@ ldd out/bb-probe out/gpu/libbbgpu.so out/bb-gpu-capabilities | awk '/=> \// {pri
         [[ $name =~ $system ]] || cp -L "$path" "$dest/bin/lib/$name"
     done
 cp scripts/prepare.py scripts/link_modules.py scripts/link_libc.py scripts/content_profile.py \
-   scripts/render_720p.py scripts/render_res.py scripts/trophies.py scripts/cheats.py "$dest/scripts/"
+   scripts/render_720p.py scripts/render_res.py scripts/trophies.py scripts/cheats.py \
+   scripts/pkg_extract.py scripts/pkg_keys.py "$dest/scripts/"
 cp run.py LICENSE "$dest/"
 cp launcher/uncharted.png "$dest/launcher/"
 cp README.md "$dest/README.md"

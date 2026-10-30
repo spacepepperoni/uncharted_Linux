@@ -86,6 +86,7 @@ void runtime_audio_report(void);
 uintptr_t runtime_pad_resolve(const char *name);
 void runtime_pad_report(void);
 int runtime_pad_tool(int test, int strength);
+int runtime_pad_watch(int seconds);
 uintptr_t runtime_rtc_resolve(const char *name);
 const char *runtime_file_user_dir(void);
 void runtime_savedata_configure(const char *title);

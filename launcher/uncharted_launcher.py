@@ -199,8 +199,8 @@ FIXES = {
         {'on': {'BB_SCALAR_COPY64_SYNC': '2', 'BB_SCALAR_COPY64_DEFER': '1'},
          'off': {'BB_SCALAR_COPY64_SYNC': '0', 'BB_SCALAR_COPY64_DEFER': '0'}}),
     'fix_tiny_readback': (
-        'Aim and turret focus (Uncharted 2)',
-        'Enemies stay in focus when aiming. Automatic: on in Uncharted 2 only; elsewhere it costs about 13%.',
+        'Aim and turret focus (Uncharted 2 and 3)',
+        'Enemies stay in focus when aiming. Automatic: on in Uncharted 2 and 3; it can cost about 13% of the frame rate.',
         {'on': {'BB_TINY_READBACK': '1'}, 'off': {'BB_TINY_READBACK': '0'}}),
     'fix_small_buffers': (
         'Brightness flicker fix',
@@ -396,14 +396,17 @@ def vibration_strength(s):
 def controller_probe_path():
     """The packaged or development loader, which also provides the lightweight controller probe."""
     configured = os.environ.get('BB_PROBE')
-    candidates = ([Path(configured)] if configured else []) + [PORT_DIR / 'bin' / 'bb-probe.exe',
-                                                               PORT_DIR / 'out' / 'bb-probe.exe']
+    name = 'bb-probe.exe' if WINDOWS else 'bb-probe'  # Linux fork: the Linux loader's name
+    candidates = ([Path(configured)] if configured else []) + [PORT_DIR / 'bin' / name, PORT_DIR / 'out' / name]
     return next((path for path in candidates if path.is_file()), None)
 
 
 def controller_probe_environment(probe):
     """Development builds find SDL beside MSYS2; packages already keep it beside bb-probe."""
     env = dict(os.environ)
+    if not WINDOWS:  # Linux fork: the loader's own libraries (bin/lib), as run.py starts it
+        env['LD_LIBRARY_PATH'] = os.pathsep.join(filter(None, [str(probe.parent / 'lib'), env.get('LD_LIBRARY_PATH')]))
+        return env
     if not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
@@ -567,6 +570,7 @@ def game_environment(s, start=None):
     env['BB_FRAME_GEN'] = str(s.get('frame_generation') or 'off')
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
     if not WINDOWS:  # Linux fork: Steam Deck mode, before the player's own variables
+        uncharted_linux.update_environment(s, env)
         uncharted_linux.deck_environment(s, env)
     for key, (_title, _hint, choices) in FIXES.items():
         env.update(choices.get(str(s.get(key) or 'auto'), {}))
