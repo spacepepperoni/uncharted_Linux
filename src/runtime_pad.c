@@ -82,19 +82,65 @@ static void touch_click(PadData *d, int right) {
     d->touches[0]=(PadTouch){.x=right ? 1440 : 480,.y=471,.id=0};
 }
 
-/* Opens the first gamepad SDL knows about; called under lock. */
+/* Linux fork: every connected gamepad stays open and the game reads the one in use: the last
+ * that had a button pressed or a stick or trigger pushed past half way, else the first. Only
+ * the first was read before, so the controller in the player's hands was ignored whenever
+ * another one came first in SDL's list (a Steam Deck's built-in controller next to a pad, or a
+ * handheld's hidden controller next to the virtual one of Bazzite's InputPlumber; issues
+ * #60, #61). Called under lock. */
+#define MAX_GAMEPADS 8
+static SDL_Gamepad *gamepads[MAX_GAMEPADS];
+static int gamepad_count;
+static uint64_t gamepads_listed_us;
+
+static int gamepad_active(SDL_Gamepad *g) {
+    for (int b=0;b<SDL_GAMEPAD_BUTTON_COUNT;++b) if (SDL_GetGamepadButton(g,(SDL_GamepadButton)b)) return 1;
+    for (int a=0;a<SDL_GAMEPAD_AXIS_COUNT;++a) {
+        const int v=SDL_GetGamepadAxis(g,(SDL_GamepadAxis)a);
+        if (v>16384 || v<-16384) return 1;
+    }
+    return 0;
+}
+
+static void list_gamepads(void) {
+    for (int i=0;i<gamepad_count;) {
+        if (SDL_GamepadConnected(gamepads[i])) { ++i; continue; }
+        if (gamepads[i]==gamepad) gamepad=NULL;
+        SDL_CloseGamepad(gamepads[i]);
+        gamepads[i]=gamepads[--gamepad_count];
+    }
+    int count=0;
+    SDL_JoystickID *ids=SDL_GetGamepads(&count);
+    for (int k=0;ids && k<count && gamepad_count<MAX_GAMEPADS;++k) {
+        int known=0;
+        for (int i=0;i<gamepad_count && !known;++i) known=SDL_GetGamepadID(gamepads[i])==ids[k];
+        if (known) continue;
+        SDL_Gamepad *g=SDL_OpenGamepad(ids[k]);
+        if (!g) continue;
+        gamepads[gamepad_count++]=g;
+        ++connected_count;
+        printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(g));
+    }
+    SDL_free(ids);
+}
+
 static SDL_Gamepad *current_gamepad(void) {
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
     if (sdl_ready<0) return NULL;
-    if (gamepad && !SDL_GamepadConnected(gamepad)) { SDL_CloseGamepad(gamepad); gamepad=NULL; }
-    if (!gamepad) {
-        int count=0;
-        SDL_JoystickID *ids=SDL_GetGamepads(&count);
-        if (ids && count>0) {
-            gamepad=SDL_OpenGamepad(ids[0]);
-            if (gamepad) { ++connected_count; printf("Runtime: gamepad connected: %s\n",SDL_GetGamepadName(gamepad)); }
+    const uint64_t now=now_us();
+    if (!gamepad || !SDL_GamepadConnected(gamepad) || now-gamepads_listed_us>500000) {
+        gamepads_listed_us=now;
+        list_gamepads();
+    }
+    if (!gamepad && gamepad_count) gamepad=gamepads[0];
+    if (gamepad_count>1 && !gamepad_active(gamepad)) {
+        for (int i=0;i<gamepad_count;++i) {
+            if (gamepads[i]!=gamepad && gamepad_active(gamepads[i])) {
+                gamepad=gamepads[i];
+                printf("Runtime: gamepad in use: %s\n",SDL_GetGamepadName(gamepad));
+                break;
+            }
         }
-        SDL_free(ids);
     }
     return gamepad;
 }
@@ -1231,5 +1277,32 @@ int runtime_pad_tool(int test, int strength) {
     }
     SDL_CloseGamepad(pad);
     if (!already_ready) SDL_QuitSubSystem(SDL_INIT_GAMEPAD);
+    return 0;
+}
+
+/* Linux fork: --controller-watch SECONDS, for controller reports and tests: the gamepads SDL lists
+ * and, while the player presses buttons, the one the game reads (current_gamepad). */
+int runtime_pad_watch(int seconds) {
+    if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
+        fprintf(stderr,"Controller detection failed: %s\n",SDL_GetError());
+        return 1;
+    }
+    sdl_ready=1;
+    SDL_Delay(500);
+    SDL_UpdateGamepads();
+    const uint64_t end=now_us()+(uint64_t)(seconds>0 ? seconds : 5)*1000000u;
+    SDL_Gamepad *last=NULL;
+    unsigned presses=0;
+    int was_down=0;
+    while (now_us()<end) {
+        SDL_UpdateGamepads();
+        SDL_Gamepad *g=current_gamepad();
+        if (g!=last) { last=g; printf("reading=%s\n",g ? SDL_GetGamepadName(g) : "none"); }
+        const int down=g && SDL_GetGamepadButton(g,SDL_GAMEPAD_BUTTON_SOUTH);
+        if (down && !was_down) ++presses;
+        was_down=down;
+        SDL_Delay(5);
+    }
+    printf("gamepads=%d\npresses_read=%u\n",gamepad_count,presses);
     return 0;
 }

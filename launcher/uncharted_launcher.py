@@ -396,14 +396,17 @@ def vibration_strength(s):
 def controller_probe_path():
     """The packaged or development loader, which also provides the lightweight controller probe."""
     configured = os.environ.get('BB_PROBE')
-    candidates = ([Path(configured)] if configured else []) + [PORT_DIR / 'bin' / 'bb-probe.exe',
-                                                               PORT_DIR / 'out' / 'bb-probe.exe']
+    name = 'bb-probe.exe' if WINDOWS else 'bb-probe'  # Linux fork: the Linux loader's name
+    candidates = ([Path(configured)] if configured else []) + [PORT_DIR / 'bin' / name, PORT_DIR / 'out' / name]
     return next((path for path in candidates if path.is_file()), None)
 
 
 def controller_probe_environment(probe):
     """Development builds find SDL beside MSYS2; packages already keep it beside bb-probe."""
     env = dict(os.environ)
+    if not WINDOWS:  # Linux fork: the loader's own libraries (bin/lib), as run.py starts it
+        env['LD_LIBRARY_PATH'] = os.pathsep.join(filter(None, [str(probe.parent / 'lib'), env.get('LD_LIBRARY_PATH')]))
+        return env
     if not (probe.parent / 'SDL3.dll').is_file():
         clang64 = Path(env.get('MSYS2_ROOT', r'C:\msys64')) / 'clang64' / 'bin'
         if clang64.is_dir():
