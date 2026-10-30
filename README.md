@@ -39,7 +39,7 @@ This client ships with a built in updater that can be toggled on/off, and update
 
 ## Files needed 
 
-You must have an unencrypted extracted dump of the Uncharted: The Nathan Drake Collection (CUSA02320) v1.00.
+You must have an unencrypted extracted dump of the Uncharted: The Nathan Drake Collection (CUSA02320) v1.00 or the .pkg file.
 
 Point the launcher to this folder in the Game tab. By default, a new Saves folder will appear within your Game folder.
 
