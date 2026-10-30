@@ -1116,6 +1116,7 @@ int main(int argc, char **argv) {
     if (argc == 2 && !strcmp(argv[1], "--controller-info")) return runtime_pad_tool(0,100);
     if (argc == 3 && !strcmp(argv[1], "--controller-test"))
         return runtime_pad_tool(1,atoi(argv[2]));
+    if (argc == 3 && !strcmp(argv[1], "--controller-watch")) return runtime_pad_watch(atoi(argv[2]));
     check_cpu();
 #ifdef _WIN32
     /* The PS4 user range must stay free of host allocations (GPU driver, heaps), and the guest
