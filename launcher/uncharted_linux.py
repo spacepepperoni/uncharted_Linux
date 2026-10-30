@@ -408,6 +408,7 @@ def apply_defaults(ns):
     """Linux settings the Windows launcher does not have: Steam Deck mode (on by default on
     SteamOS) and a 30 FPS frame rate."""
     ns['APP_DEFAULTS'].setdefault('steam_deck', steam_deck())
+    ns['APP_DEFAULTS'].setdefault('update_dir', '')  # the title update's folder (Files page)
     # No Fixes page: each fix stays automatic (run.py turns it on where it helps), whatever an
     # earlier version saved for it.
     for key, (title, hint, _choices) in ns['FIXES'].items():
@@ -480,6 +481,14 @@ def deck_allows(key, value):
     if key == 'frame_rate':
         return value in DECK_FRAME_RATES
     return value not in DECK_UNAVAILABLE.get(key, ())
+
+
+def update_environment(settings, env):
+    """The title update (1.02) as its own folder: run.py merges it over the game. Empty: the
+    <game folder>-UPDATE folder beside the game (shadPS4's layout), when there is one."""
+    folder = str(settings.get('update_dir') or '').strip()
+    if folder:
+        env['BB_GAME_UPDATE_DIR'] = folder
 
 
 def deck_environment(settings, env):
@@ -1179,6 +1188,9 @@ def launcher_class(base, ns):
             self.folder(f, 'game_dir', _('Game folder'), _('The folder with eboot.bin'),
                         _('The folder with eboot.bin, big2-ps4_Shipping.elf and big3-ps4_Shipping.elf.'),
                         on_change=self.refresh)
+            self.folder(f, 'update_dir', _('Update folder'), _('The folder of the game update (1.02)'),
+                        _('Optional: the game update (1.02) as its own folder. Empty: the folder named like the '
+                          'game folder with -UPDATE, when there is one beside it.'))
             self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'),
                         _('Empty: a Saves folder in the game folder.'))
             self.section(f, _('Saves'))

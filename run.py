@@ -125,6 +125,61 @@ def locate(env, name):
     return folder, name
 
 
+def update_folder(env, game):
+    """Linux fork: the game's title update (1.02), installed as its own folder: BB_GAME_UPDATE_DIR,
+    or shadPS4's <game folder>-UPDATE (or -patch) beside the game. BB_GAME_UPDATE_DIR=0: none."""
+    chosen = env.get('BB_GAME_UPDATE_DIR', '').strip()
+    if chosen == '0' or WINDOWS:
+        return None
+    candidates = [Path(chosen)] if chosen else \
+        [game.parent / f'{game.name}{suffix}' for suffix in ('-UPDATE', '-update', '-patch', '-PATCH')]
+    found = next((c for c in candidates if (c / 'sce_sys' / 'param.sfo').is_file()), None)
+    if chosen and not found:
+        print(f'Title update: {chosen} has no sce_sys/param.sfo; playing without it')
+    return found
+
+
+def merge_update(base, update, view):
+    """The game as its update leaves it, as links in `view`: a file of the update replaces the
+    game's (names compared without case, as on the PS4), folders in both are merged, everything
+    else links to where it is. Rebuilt only when either folder changes."""
+    import shutil
+
+    def signature():
+        newest, count = 0.0, 0
+        for root in (update, base):
+            for path in ([root] if root is base else [root, *root.rglob('*')]):
+                count += 1
+                newest = max(newest, path.stat().st_mtime)
+        return f'{base}\n{update}\n{count} {newest}\n'
+
+    def merge(b, u, v):
+        v.mkdir()
+        old = {p.name.lower(): p for p in b.iterdir()} if b else {}
+        new = {p.name.lower(): p for p in u.iterdir()}
+        for key in sorted(set(old) | set(new)):
+            bp, up = old.get(key), new.get(key)
+            target = v / (bp or up).name
+            if bp and up and bp.is_dir() and up.is_dir():
+                merge(bp, up, target)
+            else:
+                target.symlink_to(up or bp)
+
+    stamp = view.with_name(view.name + '.merged-from')
+    wanted = signature()
+    if stamp.is_file() and stamp.read_text(encoding='utf-8', errors='replace') == wanted:
+        return view
+    print(f'Title update: merging {update} over {base} ...')
+    building = view.with_name(view.name + '.new')
+    shutil.rmtree(building, ignore_errors=True)
+    building.parent.mkdir(parents=True, exist_ok=True)
+    merge(base, update, building)
+    shutil.rmtree(view, ignore_errors=True)
+    building.rename(view)
+    stamp.write_text(wanted, encoding='utf-8')
+    return view
+
+
 def game_cheats(enabled, exe):
     """BB_CHEATS ("u1:health,u2:ammo") reduced to the running executable's own entries ("health")."""
     key = next((k for k, name in EXECUTABLES.items() if name == exe), None)
@@ -397,6 +452,9 @@ def main():
         game, file = locate(env, exe)
         if not game:
             fail('Set BB_GAME_DIR to the game folder (the one with eboot.bin).')
+        if update := update_folder(env, game):  # Linux fork: title update 1.02 (issue #58)
+            game = merge_update(game, update, out_root / 'updated' / game.name)
+            print(f'Title update: {update}')
         if not (game / file).is_file():
             fail(f'No {file} in {game}.')
         out = out_root / Path(exe).stem.split('-')[0]
