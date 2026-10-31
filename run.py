@@ -450,10 +450,10 @@ def main():
         env['BB_SKIP_COLLECTION_MENU'] = '1'
     # Uncharted 2 reads the results of GPU work (grenade explosions, vehicle damage, the convoy
     # of chapter 21) from memory it also writes: merging leaves them on the GPU, so it runs with
-    # accurate GPU memory (BB_GPU_MERGE=0) unless the player chose otherwise. Uncharted 3 runs the
-    # same engine and showed the same floating NPCs (Linux fork), so it does too.
-    # Its aim and turret blur reads tiny render results back (BB_TINY_READBACK, ~13% elsewhere).
-    # Uncharted 3 aims the same way (Linux fork: blur while aiming, issue #59), so it does too.
+    # accurate GPU memory (BB_GPU_MERGE=0) unless the player chose otherwise.
+    # Aim and turret blur: the game reads a tiny render result (focus depth) on the CPU, so it is read back
+    # (BB_TINY_READBACK). On for U2 and U3: no measurable cost in U3 (square and chateau fight). U1 unchanged.
+    # (Linux fork: the U3 blur while aiming was issue #59.)
     player_merge = env.get('BB_GPU_MERGE')
     player_tiny = env.get('BB_TINY_READBACK')
     player_copy = env.get('BB_SCALAR_COPY64_SYNC')
@@ -466,10 +466,16 @@ def main():
                 env.pop('BB_GPU_MERGE', None)
         if player_tiny is None:
             env['BB_TINY_READBACK'] = '1' if exe in (EXECUTABLES['u2'], EXECUTABLES['u3']) else '0'
-        # Its mesh raycaster copies land in guest memory too (iSubMesh after checkpoints).
+        # The mesh raycaster copies land in guest memory too (iSubMesh after checkpoints; U1 crashes
+        # in the Customs House and cutscenes without it). On for U1 and U2: -9 to -16% at 110-130 FPS
+        # in U1, so none at 60. Off in U3: it cost 94 -> 54 FPS in Cartagena square.
+        # Linux fork: the small GPU results (weapons drawn black) are read back for every game by
+        # default (Rasterizer::NoteSmallWrittenBuffers, asynchronously), so upstream's per-game
+        # BB_READBACK_SMALL_BUFFERS choice is not set here.
         if player_copy is None:
-            env['BB_SCALAR_COPY64_SYNC'] = '2' if exe == EXECUTABLES['u2'] else '0'
-            env['BB_SCALAR_COPY64_DEFER'] = '1' if exe == EXECUTABLES['u2'] else '0'
+            copy_on = exe in (EXECUTABLES['u1'], EXECUTABLES['u2'])
+            env['BB_SCALAR_COPY64_SYNC'] = '2' if copy_on else '0'
+            env['BB_SCALAR_COPY64_DEFER'] = '1' if copy_on else '0'
         # Chained end-of-shader labels (toggle2 4) and met display-label waits without a drain
         # (toggle2 8) were measured in U2 only: off for U1 and U3 until they are.
         if exe in (EXECUTABLES['u1'], EXECUTABLES['u3']):
