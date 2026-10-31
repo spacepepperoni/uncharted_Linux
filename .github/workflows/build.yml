@@ -58,6 +58,12 @@ jobs:
         run: |
           git config --global --add safe.directory '*'
           BB_JOBS=3 bash build.sh
+      - name: DLSS and FSR 4
+        run: |
+          # NVIDIA DLSS/DLAA and DLSS Frame Generation (bridge + SDK libraries in out/dlss) and the
+          # FSR 4 assets (fsr4_shaders/); package.sh puts both into the AppImage.
+          bash packaging/linux/build_dlss.sh
+          bash tools/fetch_fsr4_assets.sh
       - name: Package
         run: |
           version=$(sed -n "s/^VERSION = '\(.*\)'/\1/p" launcher/uncharted_launcher.py | head -1)
