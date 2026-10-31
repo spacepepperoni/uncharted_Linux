@@ -58,6 +58,10 @@ jobs:
         run: |
           git config --global --add safe.directory '*'
           BB_JOBS=3 bash build.sh
+      - name: NVIDIA DLSS
+        # Linux fork: package.sh bundles DLSS (DLAA, Frame Generation) only when this has put the
+        # bridge and NVIDIA's DLSS libraries in out/dlss; without it the game fell back to FSR 3.1.
+        run: bash packaging/linux/build_dlss.sh
       - name: Package
         run: |
           version=$(sed -n "s/^VERSION = '\(.*\)'/\1/p" launcher/uncharted_launcher.py | head -1)
