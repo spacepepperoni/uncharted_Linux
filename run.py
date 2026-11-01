@@ -28,6 +28,7 @@ import sys
 PORT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PORT / 'scripts'))
 import cheats
+from prepare import collection_folder
 EXECUTABLES = {'u1': 'eboot.bin', 'u2': 'big2-ps4_Shipping.elf', 'u3': 'big3-ps4_Shipping.elf'}
 LOADEXEC_EXIT = 101  # runtime_services.c: the game asked for another executable
 WINDOWS = sys.platform == 'win32'
@@ -170,7 +171,10 @@ def locate(env, name):
     if not folder:
         return None, name
     folder = Path(folder)
-    if own and not (folder / name).is_file() and (folder / 'eboot.bin').is_file():
+    # Not in a collection folder: there eboot.bin is Uncharted 1, and an incomplete dump without
+    # big2/big3 started Uncharted 1 on half its files (a player's log, 2026-11-01).
+    if own and not (folder / name).is_file() and (folder / 'eboot.bin').is_file() \
+            and not collection_folder(folder):
         name = 'eboot.bin'
     return folder, name
 
@@ -521,7 +525,8 @@ def main():
             game = app0 = merge_update(game, update, out_root / 'updated' / game.name)
             print(f'Title update: {update}')
         if not (game / file).is_file():
-            fail(f'No {file} in {game}.')
+            fail(f'No {file} in {game}: the game dump is incomplete (extract the game again) or the wrong folder '
+                 'is chosen for this game.')
         out = out_root / Path(exe).stem.split('-')[0]
         prepare(game, file, out)
         image = render_resolution(env, exe, out, out / 'boot-linked.bin')

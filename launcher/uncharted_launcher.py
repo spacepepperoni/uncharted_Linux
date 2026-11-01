@@ -392,8 +392,16 @@ def game_available(s, key):
     import zar_index
     if zar_index.is_zar(folder):   # a packed game (Linux fork, issue #70)
         root = zar_index.root_entries(folder) or {}
-        return any(root.get(name.lower(), ('', False))[1] for name in (exe, *(['eboot.bin'] if own else [])))
-    return (Path(folder) / exe).is_file() or bool(own and (Path(folder) / 'eboot.bin').is_file())
+        if root.get(exe.lower(), ('', False))[1]:
+            return True
+        # (a packed collection: its eboot.bin is Uncharted 1, as below)
+        collection = 'u1data' in root and not root['u1data'][1]
+        return bool(own and root.get('eboot.bin', ('', False))[1] and not collection)
+    if (Path(folder) / exe).is_file():
+        return True
+    # In a collection folder eboot.bin is Uncharted 1, not this game (run.py locate).
+    from prepare import collection_folder
+    return bool(own and (Path(folder) / 'eboot.bin').is_file() and not collection_folder(folder))
 
 
 def mouse_sensitivity(s):
