@@ -319,7 +319,7 @@ void SignalEop(const PM4CmdEventWriteEop& eop) {
 void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     const auto eop = *reinterpret_cast<const PM4CmdEventWriteEop*>(data);
     // Raycaster copies deferred before this packet land before its label shows (landing_gate.h).
-    const u64 landing_seq = VideoCore::LandingGate::Pending();
+    u64 landing_seq = VideoCore::LandingGate::Pending();
     rasterizer.ProcessDownloadImages();
     rasterizer.GetBufferCache().CheckStableBindings();
     rasterizer.CheckConstants();
@@ -342,6 +342,7 @@ void RunEventWriteEop(Vulkan::Rasterizer& rasterizer, const u8* data) {
     // bbport: small buffers compute shaders wrote since the last event (see
     // Rasterizer::NoteSmallWrittenBuffers): the game reads them from guest memory.
     rasterizer.ReadBackSmallWrittenBuffers();
+    landing_seq = VideoCore::LandingGate::Pending(); // the ones just deferred included
     // Guest memory copies on the copy threads precede the fence the guest sees.
     // BB_ASYNC_FENCES=1 writes it once they are done instead of waiting for them; measured
     // slower (79 vs 83 FPS): the guest waits on these fences, and later fences stall it more
@@ -676,7 +677,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::WaitOnDeCounterDiff: {
             const auto diff = it_body[0];
-            while ((cblock.de_count - cblock.ce_count) >= diff) {
+            while (cblock.ce_count >= cblock.de_count &&
+                   (cblock.ce_count - cblock.de_count) >= diff) {
                 YIELD_CE();
             }
             break;
@@ -1563,7 +1565,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
+                while (cblock.ce_count <= cblock.de_count && ce_task.handle &&
+                       !ce_task.handle.done()) {
                     RESUME_GFX(ce_task);
                 }
                 break;

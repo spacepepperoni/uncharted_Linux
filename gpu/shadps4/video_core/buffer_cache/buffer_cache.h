@@ -121,7 +121,10 @@ public:
     /// bbport: whether DeferGuestCopy can take a raycaster copy of this range (its checks that don't
     /// depend on the arena), so callers that rely on the deferral can fall back in time.
     [[nodiscard]] bool CanDeferGuestCopy(VAddr src, VAddr dst, u64 size) const;
-    bool DeferGuestCopy(VAddr src, VAddr dst, u64 size);
+    /// gated false: the labels the guest sees do not wait for this landing (it lands once the GPU
+    /// work is done, in order with the others). guest_part false: only the GPU-written bytes of [src, src + size) land (dst == src, no
+    /// guest copy): a GPU result the guest reads in place (Rasterizer::ReadBackSmallWrittenBuffers).
+    bool DeferGuestCopy(VAddr src, VAddr dst, u64 size, bool guest_part = true, bool gated = true);
     u64 PendingLanding() const;
     bool LandingGateActive() const;
     void WaitLanding(u64 seq);
