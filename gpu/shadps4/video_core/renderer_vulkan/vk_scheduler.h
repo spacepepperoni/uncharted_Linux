@@ -829,6 +829,10 @@ public:
     /// Waits until every recorded command is in the command buffer.
     void SyncRecording();
 
+    /// bbport: true on the Vulkan recording thread, which runs deferred label signals (and so
+    /// the guest interrupts behind them) but must never wait for itself in SyncRecording.
+    static bool OnRecorderThread();
+
     /// bbport: guest memory copies on the recording thread (small ones, RecordHostCopy) or the
     /// copy threads (BbCopy::Async) must be done before the guest learns the GPU is past them
     /// (it may then rewrite the memory, e.g. UI vertices: flickering) and before the
@@ -920,11 +924,6 @@ private:
     std::unique_ptr<RecordChunk> AcquireChunk();
 
     void RecorderThread(std::stop_token stoken);
-
-public:
-    /// bbport: the calling thread is a scheduler's Vulkan recording thread (deferred fences and
-    /// their interrupts run there; nothing it calls may wait for that thread to go idle).
-    static bool OnRecorderThread();
 
 private:
 
