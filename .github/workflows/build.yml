@@ -62,6 +62,11 @@ jobs:
         # Linux fork: package.sh bundles DLSS (DLAA, Frame Generation) only when this has put the
         # bridge and NVIDIA's DLSS libraries in out/dlss; without it the game fell back to FSR 3.1.
         run: bash packaging/linux/build_dlss.sh
+      - name: FSR 4
+        # Linux fork (PR #45 by Tutuzaooo): package.sh bundles the FSR 4 assets (all presets, the
+        # 1080 and 2160 tiers) only when this has fetched them into fsr4_shaders/; without them
+        # an FSR 4 choice fell back to FSR 3.1.
+        run: bash tools/fetch_fsr4_assets.sh
       - name: Package
         run: |
           version=$(sed -n "s/^VERSION = '\(.*\)'/\1/p" launcher/uncharted_launcher.py | head -1)
