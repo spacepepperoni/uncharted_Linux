@@ -304,6 +304,51 @@ def steam_command(steam, launcher_file, game):
     return str(exe), options
 
 
+def clear_compat_tool(steam, appid):
+    """Removes the compatibility tool (Proton) Steam keeps for the shortcut `appid` in
+    <Steam>/config/config.vdf (CompatToolMapping). Steam keeps it by app id, and a shortcut added
+    again gets the same id, so a Proton chosen once stayed: Proton cannot start the AppImage, and
+    Play stopped after a second with nothing in the logs (issue #73). Steam must be closed (it
+    writes the file when it exits). Returns whether an entry was removed."""
+    path = Path(steam) / 'config' / 'config.vdf'
+    try:
+        text = path.read_text(encoding='utf-8')
+    except (OSError, UnicodeDecodeError):
+        return False
+    tokens = [(m.start(), m.end(), m.group(1) if m.group(1) is not None else m.group(0))
+              for m in re.finditer(r'"((?:[^"\\]|\\.)*)"|[{}]', text)]
+    for i, (_s, _e, value) in enumerate(tokens):
+        if value.lower() != 'compattoolmapping' or i + 1 >= len(tokens) or tokens[i + 1][2] != '{':
+            continue
+        depth, j = 0, i + 1
+        while j < len(tokens):
+            value = tokens[j][2]
+            if value == '{':
+                depth += 1
+            elif value == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+            elif depth == 1 and value == str(appid) and j + 1 < len(tokens) and tokens[j + 1][2] == '{':
+                level, k = 0, j + 1
+                while k < len(tokens):
+                    level += {'{': 1, '}': -1}.get(tokens[k][2], 0)
+                    if level == 0:
+                        break
+                    k += 1
+                start = text.rfind('\n', 0, tokens[j][0]) + 1
+                end = text.find('\n', tokens[k][1])
+                end = len(text) if end < 0 else end + 1
+                try:
+                    path.with_name('config.vdf.bak').write_text(text, encoding='utf-8')
+                    path.write_text(text[:start] + text[end:], encoding='utf-8')
+                except OSError:
+                    return False
+                return True
+            j += 1
+    return False
+
+
 REPO_URL = 'https://github.com/spacepepperoni/uncharted_Linux'
 
 
@@ -1628,9 +1673,11 @@ def launcher_class(base, ns):
                 for config in configs:
                     bbport_steam.add_shortcut(config / 'shortcuts.vdf', name, exe, str(start_dir),
                                               str(icon) if icon.is_file() else '', options, match_options=True)
+                    appid = bbport_steam.shortcut_id(f'"{exe}"', name)
+                    if clear_compat_tool(steam, appid):  # a Proton chosen before (issue #73)
+                        uncharted_logs.note(f'Steam: compatibility tool removed from {name} ({appid})')
                     try:  # library pictures: SteamGridDB's, else the player's own game folder's
                         import uncharted_art
-                        appid = bbport_steam.shortcut_id(f'"{exe}"', name)
                         if not uncharted_art.steamgriddb_artwork(key, config / 'grid', appid):
                             uncharted_art.steam_artwork(self.app['game_dir'], config / 'grid', appid)
                     except Exception:
