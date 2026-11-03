@@ -1,6 +1,9 @@
 // bbport: optimizations that can be switched off while the game runs (BB_TOGGLE_FILE,
 // see runtime_memory.c), to find which one changes rendering without restarting.
 #pragma once
+#include <tuple>
+#include <map>
+#include <mutex>
 #include <atomic>
 #include <csetjmp>
 #include <chrono>
@@ -205,6 +208,37 @@ inline std::atomic<std::uint64_t> reduced_draws{0}, scene_draws{0};
 /// for host copies before a submission or fence, and for GPU ticks.
 inline std::atomic<std::uint64_t> sync_recording_ns{0}, host_copies_wait_ns{0}, tick_wait_ns{0},
     copy_threads_wait_ns{0}, host_copy_waits{0};
+/// bbport (BB_FRAME_STATS): GPU thread wait time by kind (0 host copies, 1 deferred signals,
+/// 2 GPU ticks) and caller, printed with the draw pipe statistics (Rasterizer::PrintPipeStats).
+struct WaitSites {
+    std::mutex mutex;
+    std::map<std::tuple<int, const char*, unsigned>, std::uint64_t> ns;
+};
+inline WaitSites wait_sites;
+/// bbport (BB_FRAME_STATS): deferred guest signals (SignalAfterHostCopies): count, and summed ns
+/// from issue to the recording thread reaching it, to the copies done, to it running (landing).
+inline std::atomic<std::uint64_t> deferred_count{0}, deferred_to_recorder_ns{0},
+    deferred_to_copies_ns{0}, deferred_to_fire_ns{0};
+inline std::uint64_t NowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+inline void NoteWaitSite(int kind, const char* function, unsigned line, std::uint64_t ns) {
+    std::scoped_lock lk{wait_sites.mutex};
+    wait_sites.ns[{kind, function, line}] += ns;
+}
+struct SiteTimer {
+    int kind;
+    const char* function;
+    unsigned line;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    ~SiteTimer() {
+        NoteWaitSite(kind, function, line,
+                     std::chrono::duration_cast<std::chrono::nanoseconds>(
+                         std::chrono::steady_clock::now() - start).count());
+    }
+};
 struct WaitTimer {
     std::atomic<std::uint64_t>& total;
     std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();

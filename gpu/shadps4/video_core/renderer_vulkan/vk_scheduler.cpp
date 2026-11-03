@@ -256,11 +256,16 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_
     }
     BbCopy::FlushBatch();
     deferred_signals_issued.fetch_add(1, std::memory_order_relaxed);
+    const u64 t0 = BbStats::NowNs();
     Record([signal = std::move(signal), done = deferred_signals_done, landing_seq,
-            off_recorder](vk::CommandBuffer) mutable {
+            off_recorder, t0](vk::CommandBuffer) mutable {
+        BbStats::deferred_to_recorder_ns.fetch_add(BbStats::NowNs() - t0, std::memory_order_relaxed);
         BbCopy::AfterCopies([signal = std::move(signal), done = std::move(done), landing_seq,
-                             off_recorder] {
-            auto fire = [signal = std::move(signal), done = std::move(done)] {
+                             off_recorder, t0] {
+            BbStats::deferred_to_copies_ns.fetch_add(BbStats::NowNs() - t0, std::memory_order_relaxed);
+            auto fire = [signal = std::move(signal), done = std::move(done), t0] {
+                BbStats::deferred_to_fire_ns.fetch_add(BbStats::NowNs() - t0, std::memory_order_relaxed);
+                BbStats::deferred_count.fetch_add(1, std::memory_order_relaxed);
                 signal();
                 done->fetch_add(1, std::memory_order_release);
             };
@@ -276,13 +281,14 @@ void Scheduler::SignalAfterHostCopies(std::function<void()> signal, u64 landing_
     KickRecording(true);
 }
 
-void Scheduler::WaitDeferredSignals() {
+void Scheduler::WaitDeferredSignals(unsigned line, const char* function) {
     const u64 issued = deferred_signals_issued.load(std::memory_order_relaxed);
     if (deferred_signals_done->load(std::memory_order_acquire) >= issued ||
         BbToggle::Disabled(BbToggle::OrderedGuestWrites)) {
         return;
     }
     BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
+    BbStats::SiteTimer site{1, function, line};
     KickRecording(true);
     while (deferred_signals_done->load(std::memory_order_acquire) < issued) {
         if (VideoCore::LandingGate::Stopped()) {
@@ -294,10 +300,11 @@ void Scheduler::WaitDeferredSignals() {
     }
 }
 
-void Scheduler::WaitHostCopies() {
+void Scheduler::WaitHostCopies(unsigned line, const char* function) {
     if (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
         BbStats::WaitTimer timer{BbStats::host_copies_wait_ns};
         BbStats::host_copy_waits.fetch_add(1, std::memory_order_relaxed);
+        BbStats::SiteTimer site{0, function, line};
         KickRecording(true);
         while (host_copies_done.load(std::memory_order_acquire) < host_copies_issued) {
             std::this_thread::yield();
@@ -431,13 +438,14 @@ void Scheduler::WaitSubmitted() {
     }
 }
 
-void Scheduler::Wait(u64 tick) {
+void Scheduler::Wait(u64 tick, unsigned line, const char* function) {
     if (tick >= work_semaphore.CurrentTick()) {
         // Make sure we are not waiting for the current tick without signalling
         SubmitInfo info{};
         Flush(info);
     }
     BbStats::WaitTimer timer{BbStats::tick_wait_ns};
+    BbStats::SiteTimer site{2, function, line};
     work_semaphore.Wait(tick);
 }
 

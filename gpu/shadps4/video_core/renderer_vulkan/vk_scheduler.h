@@ -697,7 +697,7 @@ public:
     void WaitSubmitted();
 
     /// Waits for the given tick to trigger on the GPU.
-    void Wait(u64 tick);
+    void Wait(u64 tick, unsigned line = __builtin_LINE(), const char* function = __builtin_FUNCTION());
 
     /// bbport: prints every scheduler's timeline and the last queue submissions (GPU stall).
     static void ReportStall();
@@ -833,7 +833,7 @@ public:
     /// copy threads (BbCopy::Async) must be done before the guest learns the GPU is past them
     /// (it may then rewrite the memory, e.g. UI vertices: flickering) and before the
     /// submission that reads them. Waits for all.
-    void WaitHostCopies();
+    void WaitHostCopies(unsigned line = __builtin_LINE(), const char* function = __builtin_FUNCTION());
 
     /// Runs `copy` on the recording thread in order with the commands (the thread spins for
     /// work anyway, so small copies cost no wakeup); WaitHostCopies() covers it.
@@ -860,7 +860,8 @@ public:
     /// fences, flip): waits until every signal handed to SignalAfterHostCopies ran, so that
     /// the write cannot overtake an earlier fence. Otherwise the guest, seeing the later value,
     /// may free memory the earlier fence then writes into (corrupted heap, guest fault).
-    void WaitDeferredSignals();
+    void WaitDeferredSignals(unsigned line = __builtin_LINE(),
+                             const char* function = __builtin_FUNCTION());
 
     /// Whether a render pass with exactly this state is open.
     [[nodiscard]] bool IsRenderingWith(const RenderState& state) const {

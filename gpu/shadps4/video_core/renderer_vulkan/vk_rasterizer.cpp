@@ -1119,6 +1119,25 @@ void Rasterizer::PrintPipeStats() {
             }
         }
     }
+    std::printf("\n  GPU thread waits over 0.5%%:");
+    {
+        static constexpr const char* kinds[] = {"copies", "signals", "tick"};
+        std::scoped_lock lk{BbStats::wait_sites.mutex};
+        const double window_ns = seconds * 1e9;
+        for (const auto& [key, ns] : BbStats::wait_sites.ns) {
+            if (ns * 200 > window_ns) {
+                std::printf(" %s@%s:%u %.1f%%", kinds[std::get<0>(key)], std::get<1>(key),
+                            std::get<2>(key), 100.0 * ns / window_ns);
+            }
+        }
+        BbStats::wait_sites.ns.clear();
+        if (const u64 n = BbStats::deferred_count.exchange(0)) {
+            std::printf("\n  deferred signals %.0f/s, mean ms to recorder %.2f, copies %.2f, landed %.2f",
+                        n / seconds, BbStats::deferred_to_recorder_ns.exchange(0) / 1e6 / n,
+                        BbStats::deferred_to_copies_ns.exchange(0) / 1e6 / n,
+                        BbStats::deferred_to_fire_ns.exchange(0) / 1e6 / n);
+        }
+    }
     std::printf("\n");
     drain_sites.clear();
     draw_pipe->drains_by_reason = {};
