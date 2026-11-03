@@ -65,7 +65,9 @@ void WriteBackPage(Memory* memory, VAddr arena_addr, const Copies& copies, const
 } // namespace
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
-static constexpr size_t STREAM_BUFFER_SIZE = 128_MB;
+// Linux fork: 384 MiB (was 128), as in the MediEvil fork: busy scenes (Uncharted 1, ~3,700 draws a
+// frame on the Steam Deck) filled it and the GPU thread waited for GPU ticks ~42% of its time.
+static constexpr size_t STREAM_BUFFER_SIZE = 384_MB;
 
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
