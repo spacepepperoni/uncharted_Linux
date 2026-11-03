@@ -2715,7 +2715,6 @@ def main():
         settings['start'] = play
         if WINDOWS:
             sys.exit(play_without_window(settings))
-        uncharted_linux.rotate_logs(Path(settings.get('user_dir') or DATA_DIR / 'user'))
         # Before the game: a newer release is offered in a prompt the controller can answer
         # (Gaming Mode); after an update the game closes, to be started again.
         answer = uncharted_linux.startup_update_prompt(settings, latest_release, VERSION, PORT_DIR)
