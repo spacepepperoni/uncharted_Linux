@@ -559,19 +559,6 @@ def deck_environment(settings, env):
             env[name] = DECK_FALLBACK[key]
 
 
-def rotate_logs(folder, keep=5):
-    """last_run.log -> last_run.1.log ... (the previous runs stay readable)."""
-    folder = Path(folder)
-    for n in range(keep - 1, 0, -1):
-        older = folder / f'last_run.{n}.log'
-        newer = folder / ('last_run.log' if n == 1 else f'last_run.{n - 1}.log')
-        if newer.is_file():
-            try:
-                os.replace(newer, older)
-            except OSError:
-                pass
-
-
 def plain_info_dialogs(root):
     """Tk's information dialogs ("You have the latest version" and the like) without their
     lightbulb icon: the icon's image is emptied once Tk's dialog code is loaded, as loading it
@@ -1582,11 +1569,6 @@ def launcher_class(base, ns):
             if self.can_start(key):
                 self.var('start').set(key)
                 self.play()
-
-        def play(self):
-            if not self.process:
-                rotate_logs(Path(self.app.get('user_dir') or ns['DATA_DIR'] / 'user'))
-            super().play()
 
         def game_shortcut(self, key):
             if not self.can_start(key):
