@@ -470,6 +470,40 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            {
+                std::scoped_lock lk{BbStats::fault_read_backs.mutex};
+                u64 count = 0;
+                for (const auto& [key, value] : BbStats::fault_read_backs.regions) {
+                    count += value.first;
+                }
+                if (count) {
+                    std::printf("Fault read backs: %llu, mean ms waiting for the GPU %.2f, copying %.2f, "
+                                "%.1f KiB each, %llu already done;",
+                                static_cast<unsigned long long>(count),
+                                BbStats::fault_rb_wait_ns.exchange(0) / 1e6 / count,
+                                BbStats::fault_rb_copy_ns.exchange(0) / 1e6 / count,
+                                BbStats::fault_rb_bytes.exchange(0) / 1024.0 / count,
+                                static_cast<unsigned long long>(BbStats::fault_rb_already_done.exchange(0)));
+                    std::vector<std::pair<u64, std::pair<u64, u64>>> regions(
+                        BbStats::fault_read_backs.regions.begin(), BbStats::fault_read_backs.regions.end());
+                    std::sort(regions.begin(), regions.end(),
+                              [](const auto& a, const auto& b) { return a.second.second > b.second.second; });
+                    std::printf(" regions");
+                    for (size_t k = 0; k < regions.size() && k < 6; ++k) {
+                        std::printf(" 0x%llx00000 %llu/%.1fms", static_cast<unsigned long long>(regions[k].first),
+                                    static_cast<unsigned long long>(regions[k].second.first),
+                                    regions[k].second.second / 1e6);
+                    }
+                    std::printf("; threads");
+                    for (const auto& [name, value] : BbStats::fault_read_backs.threads) {
+                        std::printf(" %s %llu/%.1fms", name.c_str(), static_cast<unsigned long long>(value.first),
+                                    value.second / 1e6);
+                    }
+                    std::printf("\n");
+                }
+                BbStats::fault_read_backs.regions.clear();
+                BbStats::fault_read_backs.threads.clear();
+            }
             // Command queues waiting on memory, as a share of the window (GPU command thread).
             const u64 gfx_waits = BbStats::gfx_waits.exchange(0);
             const u64 asc_waits = BbStats::asc_waits.exchange(0);

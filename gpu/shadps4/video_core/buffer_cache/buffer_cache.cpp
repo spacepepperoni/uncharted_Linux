@@ -30,6 +30,9 @@
 
 #include <vk_mem_alloc.h>
 #include <cstdio>
+#ifndef _WIN32
+#include <pthread.h>
+#endif
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -439,7 +442,11 @@ bool BufferCache::ReadBackOnFaultThread(VAddr device_addr, u64 size) {
     if (!locked || !faulting_found || fault_tick == 0 || fault_tick >= scheduler.CurrentTick()) {
         return false;
     }
+    if (semaphore.IsFree(fault_tick)) {
+        BbStats::fault_rb_already_done.fetch_add(1, std::memory_order_relaxed);
+    }
     semaphore.Wait(fault_tick);
+    const auto waited_time = std::chrono::steady_clock::now();
     boost::container::small_vector<vk::BufferCopy, 16> copies;
     u64 total = 0;
     for (const auto& candidate : pages) {
@@ -551,6 +558,25 @@ bool BufferCache::ReadBackOnFaultThread(VAddr device_addr, u64 size) {
             .count(),
         std::memory_order_relaxed);
     BbStats::fault_thread_read_backs.fetch_add(1, std::memory_order_relaxed);
+    {
+        const auto end_time = std::chrono::steady_clock::now();
+        const u64 wait_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(waited_time - start_time).count();
+        const u64 all_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end_time - start_time).count();
+        BbStats::fault_rb_wait_ns.fetch_add(wait_ns, std::memory_order_relaxed);
+        BbStats::fault_rb_copy_ns.fetch_add(all_ns - wait_ns, std::memory_order_relaxed);
+        BbStats::fault_rb_bytes.fetch_add(total, std::memory_order_relaxed);
+        char name[32] = "?";
+#ifndef _WIN32
+        pthread_getname_np(pthread_self(), name, sizeof(name));
+#endif
+        std::scoped_lock lk{BbStats::fault_read_backs.mutex};
+        auto& region = BbStats::fault_read_backs.regions[device_addr >> 20];
+        ++region.first;
+        region.second += all_ns;
+        auto& thread = BbStats::fault_read_backs.threads[name];
+        ++thread.first;
+        thread.second += all_ns;
+    }
     return true;
 }
 

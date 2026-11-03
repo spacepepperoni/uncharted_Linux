@@ -3,6 +3,7 @@
 #pragma once
 #include <tuple>
 #include <map>
+#include <string>
 #include <mutex>
 #include <atomic>
 #include <csetjmp>
@@ -107,6 +108,17 @@ inline std::atomic<std::uint64_t> dead_gpu_drops{0}, gpu_read_backs{0};
 inline std::atomic<std::uint64_t> gpu_merges{0};
 /// ... or read back on the second queue (GPU work done; BufferCache::DownloadOnSideQueue).
 inline std::atomic<std::uint64_t> gpu_side_downloads{0}, gpu_side_download_ns{0};
+/// Test only (BB_FRAME_STATS): read backs on the faulting thread split into the wait for the GPU
+/// work that wrote the pages and the copy, bytes copied, and the 1 MiB regions and guest threads
+/// they hit (count, ns).
+inline std::atomic<std::uint64_t> fault_rb_wait_ns{0}, fault_rb_copy_ns{0}, fault_rb_bytes{0},
+    fault_rb_already_done{0};
+struct FaultReadBacks {
+    std::mutex mutex;
+    std::map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> regions;
+    std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> threads;
+};
+inline FaultReadBacks fault_read_backs;
 /// ... of which on the faulting thread (BufferCache::ReadBackOnFaultThread).
 inline std::atomic<std::uint64_t> fault_thread_read_backs{0};
 inline std::atomic<std::int64_t> hot_pages{0};
