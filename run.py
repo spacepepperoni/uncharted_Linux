@@ -451,6 +451,9 @@ def main():
     # Uncharted 2 reads the results of GPU work (grenade explosions, vehicle damage, the convoy
     # of chapter 21) from memory it also writes: merging leaves them on the GPU, so it runs with
     # accurate GPU memory (BB_GPU_MERGE=0) unless the player chose otherwise.
+    # Linux fork: Uncharted 1 too. With merging its busy scenes on the Steam Deck read GPU data
+    # back about once a frame by waiting for the whole frame (~18 ms, BB_WAIT_SITES); accurate
+    # memory waits only for the work that wrote it: 27.0 -> 28.6 FPS, 9.3 -> 5.5 slow frames/5 s.
     # Aim and turret blur: the game reads a tiny render result (focus depth) on the CPU, so it is read back
     # (BB_TINY_READBACK). On for U2 and U3: no measurable cost in U3 (square and chateau fight). U1 unchanged.
     # (Linux fork: the U3 blur while aiming was issue #59.)
@@ -460,10 +463,7 @@ def main():
     all_cheats = env.setdefault('BB_CHEATS_ALL', env.get('BB_CHEATS', ''))
     while True:
         if player_merge is None:
-            if exe in (EXECUTABLES['u2'], EXECUTABLES['u3']):
-                env['BB_GPU_MERGE'] = '0'
-            else:
-                env.pop('BB_GPU_MERGE', None)
+            env['BB_GPU_MERGE'] = '0'
         if player_tiny is None:
             env['BB_TINY_READBACK'] = '1' if exe in (EXECUTABLES['u2'], EXECUTABLES['u3']) else '0'
         # The mesh raycaster copies land in guest memory too (iSubMesh after checkpoints; U1 crashes
