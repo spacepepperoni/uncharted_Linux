@@ -15,6 +15,7 @@
 #endif
 #include "common/assert.h"
 #include "bbport_toggles.h"
+#include "video_core/renderer_vulkan/bb_wait_sites.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
 #include "common/thread.h"
@@ -470,6 +471,7 @@ void VideoOutDriver::Flip(const Request& req) {
                         BbStats::tick_wait_ns.exchange(0) / (window * 1e7),
                         frames ? double(BbStats::reduced_draws.exchange(0)) / frames : 0.0,
                         frames ? double(BbStats::scene_draws.exchange(0)) / frames : 0.0);
+            BbWaitSites::Report(); // Linux fork: BB_WAIT_SITES=1
             // Command queues waiting on memory, as a share of the window (GPU command thread).
             const u64 gfx_waits = BbStats::gfx_waits.exchange(0);
             const u64 asc_waits = BbStats::asc_waits.exchange(0);
