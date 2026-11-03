@@ -888,6 +888,57 @@ static int prompts_pad_device(SDL_Gamepad *g) {
     return SDL_GetGamepadButtonLabel(g,SDL_GAMEPAD_BUTTON_SOUTH)==SDL_GAMEPAD_BUTTON_LABEL_CROSS ? 1 : 2;
 }
 
+/* Linux fork: a desktop that turns controller buttons into keys and clicks while the game reads the
+ * controller itself (Steam's desktop layout on a Steam Deck in Desktop Mode: B is Escape, Y is
+ * Enter, the triggers are mouse clicks) gave every press twice: B for cover also opened the
+ * game's menu (issue #66). Such a copy goes down within a few milliseconds of the real button, so
+ * while a gamepad is open a key or mouse button counts only once it has been held for
+ * BB_KEY_MIRROR_MS (default 60) with no gamepad button changing around its press; a mirrored one
+ * stays ignored until released. Real keyboard and mouse presses arrive that much later.
+ * BB_KEY_MIRROR_MS=0: off. */
+static void filter_mirrored_input(SDL_Gamepad *g, uint64_t now, const bool **keys, uint32_t *mouse) {
+    static int window_us=-1;
+    if (window_us<0) {
+        const char *env=getenv("BB_KEY_MIRROR_MS");
+        window_us=(env && *env ? atoi(env) : 60)*1000;
+        if (window_us<0) window_us=0;
+    }
+    if (!g || !window_us) return;
+    /* When the gamepad's buttons last changed (a few times, for presses that arrive just after). */
+    static uint64_t pad_prev, pad_changes[8];
+    static unsigned pad_change_next;
+    uint64_t pad=0;
+    for (int b=0;b<SDL_GAMEPAD_BUTTON_COUNT && b<56;++b) if (SDL_GetGamepadButton(g,(SDL_GamepadButton)b)) pad|=1ull<<b;
+    if (SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFT_TRIGGER)>8000) pad|=1ull<<62;
+    if (SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)>8000) pad|=1ull<<63;
+    if (pad!=pad_prev) { pad_prev=pad; pad_changes[pad_change_next++%8]=now; }
+    #define MIRROR_SOURCES (SDL_SCANCODE_COUNT+8)
+    static bool held[MIRROR_SOURCES], muted[MIRROR_SOURCES], out[SDL_SCANCODE_COUNT];
+    static uint64_t down_at[MIRROR_SOURCES];
+    const bool *k=*keys;
+    uint32_t m=*mouse, mouse_out=0;
+    for (int i=0;i<MIRROR_SOURCES;++i) {
+        const bool down=i<SDL_SCANCODE_COUNT ? (k && k[i]) : ((m>>(i-SDL_SCANCODE_COUNT))&1u);
+        bool pass=false;
+        if (!down) { held[i]=muted[i]=false; }
+        else {
+            if (!held[i]) { held[i]=true; muted[i]=false; down_at[i]=now; }
+            if (!muted[i]) {
+                for (int c=0;c<8;++c) {
+                    const uint64_t t=pad_changes[c];
+                    if (t && t+(uint64_t)window_us>=down_at[i] && t<=down_at[i]+(uint64_t)window_us) { muted[i]=true; break; }
+                }
+            }
+            pass=!muted[i] && now-down_at[i]>=(uint64_t)window_us;
+        }
+        if (i<SDL_SCANCODE_COUNT) out[i]=pass;
+        else if (pass) mouse_out|=1u<<(i-SDL_SCANCODE_COUNT);
+    }
+    #undef MIRROR_SOURCES
+    if (k) *keys=out;
+    *mouse=mouse_out;
+}
+
 static void sample_host(PadData *d) {
     memset(d,0,sizeof(*d));
     d->left_x=d->left_y=d->right_x=d->right_y=128;
@@ -913,6 +964,7 @@ static void sample_host(PadData *d) {
     if (wheel>0) wheel_until_us[0]=now+80000;
     if (wheel<0) wheel_until_us[1]=now+80000;
     const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    filter_mirrored_input(g,now,&k,&mouse); /* Linux fork: Steam's desktop layout (issue #66) */
     static int layout_logged;
     if (k && !layout_logged) { layout_logged=1; log_layout_keys(); }
     if (g) {

@@ -188,9 +188,9 @@ MOUSE_SENS_MIN, MOUSE_SENS_MAX = 0.1, 10.0  # the Controls page slider (the game
 # key -> (title, hint, {choice: {variable: value}}); 'auto' sets nothing (the game's own default).
 FIXES = {
     'fix_u2_gpu_results': (
-        'Exact GPU results (Uncharted 2)',
+        'Exact GPU results',
         'Explosions, vehicle damage and the convoy of chapter 21 read results of GPU work back. '
-        'Automatic: on in Uncharted 2 only. Costs speed in busy scenes.',
+        'Automatic: on in every game. Off can be faster in some busy scenes.',
         {'on': {'BB_GPU_MERGE': '0'}, 'off': {'BB_GPU_MERGE': '1'}}),
     'fix_u2_mesh': (
         'Mesh raycaster copies (Uncharted 2)',
