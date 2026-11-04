@@ -124,7 +124,18 @@ static void list_gamepads(void) {
     SDL_free(ids);
 }
 
+/* Linux fork: the controller keeps working while the game window does not have the keyboard focus.
+ * SDL drops every gamepad event while no window of the process has it, so a game window that the
+ * desktop did not focus (started from a Steam shortcut, focus stealing prevention, a launcher or
+ * Steam still in front) read a controller the launcher showed, but nothing it pressed (issue #74).
+ * The launcher's own controller code already sets this. SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in
+ * the environment still turns it off. Before the gamepad subsystem starts. */
+static void pad_hints(void) {
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS,"1");
+}
+
 static SDL_Gamepad *current_gamepad(void) {
+    if (!sdl_ready) pad_hints();
     if (!sdl_ready) sdl_ready = SDL_WasInit(SDL_INIT_GAMEPAD) ? 1 : SDL_InitSubSystem(SDL_INIT_GAMEPAD) ? 1 : -1;
     if (sdl_ready<0) return NULL;
     const uint64_t now=now_us();
@@ -895,8 +906,11 @@ static int prompts_pad_device(SDL_Gamepad *g) {
  * while a gamepad is open a key or mouse button counts only once it has been held for
  * BB_KEY_MIRROR_MS (default 60) with no gamepad button changing around its press; a mirrored one
  * stays ignored until released. Real keyboard and mouse presses arrive that much later.
- * BB_KEY_MIRROR_MS=0: off. */
-static void filter_mirrored_input(SDL_Gamepad *g, uint64_t now, const bool **keys, uint32_t *mouse) {
+ * The sticks count as gamepad changes too (each axis in steps of a quarter past a dead zone), and
+ * a wheel step is held back as long and dropped the same way: a layout that turns the stick into
+ * arrow keys or the trackpad into the wheel gave the d-pad (the weapon selection) while Drake left
+ * cover (issue #75). BB_KEY_MIRROR_MS=0: off. */
+static void filter_mirrored_input(SDL_Gamepad *g, uint64_t now, const bool **keys, uint32_t *mouse, int *wheel) {
     static int window_us=-1;
     if (window_us<0) {
         const char *env=getenv("BB_KEY_MIRROR_MS");
@@ -904,13 +918,21 @@ static void filter_mirrored_input(SDL_Gamepad *g, uint64_t now, const bool **key
         if (window_us<0) window_us=0;
     }
     if (!g || !window_us) return;
-    /* When the gamepad's buttons last changed (a few times, for presses that arrive just after). */
+    /* When the gamepad's buttons, triggers or sticks last changed (a few times, for presses that
+     * arrive just after). */
     static uint64_t pad_prev, pad_changes[8];
     static unsigned pad_change_next;
     uint64_t pad=0;
-    for (int b=0;b<SDL_GAMEPAD_BUTTON_COUNT && b<56;++b) if (SDL_GetGamepadButton(g,(SDL_GamepadButton)b)) pad|=1ull<<b;
+    for (int b=0;b<SDL_GAMEPAD_BUTTON_COUNT && b<32;++b) if (SDL_GetGamepadButton(g,(SDL_GamepadButton)b)) pad|=1ull<<b;
     if (SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_LEFT_TRIGGER)>8000) pad|=1ull<<62;
     if (SDL_GetGamepadAxis(g,SDL_GAMEPAD_AXIS_RIGHT_TRIGGER)>8000) pad|=1ull<<63;
+    static const SDL_GamepadAxis sticks[4]={SDL_GAMEPAD_AXIS_LEFTX,SDL_GAMEPAD_AXIS_LEFTY,
+                                            SDL_GAMEPAD_AXIS_RIGHTX,SDL_GAMEPAD_AXIS_RIGHTY};
+    for (int a=0;a<4;++a) {
+        const int v=SDL_GetGamepadAxis(g,sticks[a]), size=v<0 ? -v : v;
+        const uint64_t step=size<10000 ? 0 : 1+(size-10000)/6000; /* 0..4 */
+        pad|=(step|(v<0 ? 8u : 0u))<<(32+4*a);
+    }
     if (pad!=pad_prev) { pad_prev=pad; pad_changes[pad_change_next++%8]=now; }
     #define MIRROR_SOURCES (SDL_SCANCODE_COUNT+8)
     static bool held[MIRROR_SOURCES], muted[MIRROR_SOURCES], out[SDL_SCANCODE_COUNT];
@@ -937,6 +959,21 @@ static void filter_mirrored_input(SDL_Gamepad *g, uint64_t now, const bool **key
     #undef MIRROR_SOURCES
     if (k) *keys=out;
     *mouse=mouse_out;
+    /* Wheel steps: up, down. One waits BB_KEY_MIRROR_MS; a gamepad change around it drops it. */
+    static uint64_t wheel_at[2];
+    const int w=*wheel;
+    *wheel=0;
+    for (int d=0;d<2;++d) {
+        if ((d ? w<0 : w>0) && !wheel_at[d]) wheel_at[d]=now;
+        if (!wheel_at[d]) continue;
+        int mirrored=0;
+        for (int c=0;c<8 && !mirrored;++c) {
+            const uint64_t t=pad_changes[c];
+            mirrored=t && t+(uint64_t)window_us>=wheel_at[d] && t<=wheel_at[d]+(uint64_t)window_us;
+        }
+        if (mirrored) wheel_at[d]=0;
+        else if (now-wheel_at[d]>=(uint64_t)window_us) { wheel_at[d]=0; *wheel=d ? -1 : 1; }
+    }
 }
 
 static void sample_host(PadData *d) {
@@ -961,10 +998,10 @@ static void sample_host(PadData *d) {
     }
     if (scripted) return;
     const uint64_t now=d->timestamp;
+    const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
+    filter_mirrored_input(g,now,&k,&mouse,&wheel); /* Linux fork: Steam's desktop layout (issues #66, #75) */
     if (wheel>0) wheel_until_us[0]=now+80000;
     if (wheel<0) wheel_until_us[1]=now+80000;
-    const bool *k=SDL_WasInit(SDL_INIT_VIDEO) ? SDL_GetKeyboardState(NULL) : NULL;
-    filter_mirrored_input(g,now,&k,&mouse); /* Linux fork: Steam's desktop layout (issue #66) */
     static int layout_logged;
     if (k && !layout_logged) { layout_logged=1; log_layout_keys(); }
     if (g) {
@@ -1372,6 +1409,7 @@ int runtime_pad_tool(int test, int strength) {
 /* Linux fork: --controller-watch SECONDS, for controller reports and tests: the gamepads SDL lists
  * and, while the player presses buttons, the one the game reads (current_gamepad). */
 int runtime_pad_watch(int seconds) {
+    pad_hints();
     if (!SDL_InitSubSystem(SDL_INIT_GAMEPAD)) {
         fprintf(stderr,"Controller detection failed: %s\n",SDL_GetError());
         return 1;

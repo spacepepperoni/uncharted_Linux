@@ -89,6 +89,9 @@ namespace Frontend {
 
 WindowSDL::WindowSDL(s32 width_, s32 height_, const char* title) : width{width_}, height{height_} {
     // Gamepads are sampled by runtime_pad.c; their events are pumped here with the window's.
+    // Linux fork: they keep working while the window does not have the focus (issue #74; the
+    // same hint as runtime_pad_hints in runtime_pad.c).
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     if (!SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) {
         UNREACHABLE_MSG("Failed to initialize SDL video: {}", SDL_GetError());
     }
