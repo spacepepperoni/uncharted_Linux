@@ -506,6 +506,40 @@ ROW_HINTS = {'Frame rate': None,
              'Frame generation': None, 'Multiplier': None, 'Mouse sensitivity': None}
 
 
+# What Reset to defaults keeps (issue #77): where the games, saves and title update are, the
+# player's name, pictures and Steam shortcut, the interface language and what the Library shows.
+# Setup, not settings: without them the games would not start.
+RESET_KEEPS = frozenset({'game_dir', 'game_dir_u1', 'game_dir_u2', 'game_dir_u3', 'user_dir',
+                         'update_dir', 'player_name', 'ui_language', 'start', 'trophy_game',
+                         'art_banner', 'art_u1', 'art_u2', 'art_u3', 'steam_art', 'art_crops',
+                         'shortcut_name', 'shortcut_icon'})
+
+
+def default_settings(defaults, default_pad):
+    """The settings Reset to defaults gives: the launcher's defaults, where Steam Deck mode is on
+    on a Steam Deck, and then Steam Deck mode's values on top."""
+    import copy
+    settings = {key: copy.deepcopy(value) for key, value in defaults.items() if key not in RESET_KEEPS}
+    if settings.get('steam_deck'):
+        settings.update(DECK_SETTINGS)
+    settings['pad_bindings'] = dict(default_pad)
+    settings['key_bindings'] = {}
+    return settings
+
+
+def differs_from_defaults(current, target):
+    """Whether any setting in `current` is not what Reset to defaults would give."""
+    for key, value in target.items():
+        now = current.get(key)
+        if key == 'key_bindings':
+            now = now or {}
+        elif key == 'pad_bindings':
+            now = {**value, **(now or {})}
+        if now != value:
+            return True
+    return False
+
+
 def unsaved_changes(saved, current):
     """The settings whose value in the launcher differs from the saved one."""
     return sorted(key for key in current if current[key] != saved.get(key))
@@ -892,9 +926,45 @@ def launcher_class(base, ns):
             self.save_button = PillButton(self.tk, right, _('Save changes'), self.save_changes, ns['COLORS'],
                                           self.px, self.font_button, 'primary', SURFACE, (20, 8))
             self.save_button.canvas.place(relx=1.0, rely=1.0, anchor='se', x=-self.px(22), y=-self.px(18))
+            # Reset to defaults, left of it, while any setting differs from its default (#77).
+            self.reset_button = PillButton(self.tk, right, _('Reset to defaults'), self.reset_to_defaults,
+                                           ns['COLORS'], self.px, self.font_button, 'ghost', SURFACE, (16, 8))
+            self.reset_shown = False
             for var in list(self.vars.values()) + list((getattr(self, 'pad_vars', None) or {}).values()):
                 var.trace_add('write', lambda *_a: self.after_setting_change())
             self.saved_settings = self.settings_now()
+            self.after_setting_change()
+
+        def reset_target(self):
+            return default_settings(ns['APP_DEFAULTS'], ns['DEFAULT_PAD'])
+
+        def reset_to_defaults(self):
+            """Every setting back to its default (RESET_KEEPS stay). On a Steam Deck, Steam Deck
+            mode stays on with its values; turning it off then gives the PC defaults. Saved by Save
+            changes, like any other change."""
+            target = self.reset_target()
+            self._resetting = True  # steam_deck_changed would keep the old values and save
+            try:
+                for key, value in target.items():
+                    if key in ('key_bindings', 'pad_bindings'):
+                        continue
+                    if key in self.vars:
+                        self.var(key).set(value)
+                    else:
+                        self.app[key] = value
+            finally:
+                self._resetting = False
+            if target.get('steam_deck'):
+                self.app['deck_saved'] = {key: ns['APP_DEFAULTS'][key] for key in DECK_SETTINGS}
+            else:
+                self.app.pop('deck_saved', None)
+            for key in DECK_LOCKED:
+                box = getattr(self, 'boxes', {}).get(key)
+                if box is not None:
+                    box.configure(state='disabled' if target.get('steam_deck') else 'readonly')
+            self.reset_keys()
+            if getattr(self, 'pad_vars', None):
+                self.reset_pad()
             self.after_setting_change()
 
         def var(self, key):
@@ -912,9 +982,19 @@ def launcher_class(base, ns):
 
         def after_setting_change(self):
             if hasattr(self, 'saved_settings'):
-                changed = unsaved_changes(self.saved_settings, self.settings_now())
+                now = self.settings_now()
+                changed = unsaved_changes(self.saved_settings, now)
                 self.save_button.configure(state='normal' if changed else 'disabled')
                 self.tk.Misc.lift(self.save_button.canvas)  # Canvas.lift raises drawn items
+                show_reset = differs_from_defaults(now, self.reset_target())
+                if show_reset and not self.reset_shown:
+                    gap = self.save_button.canvas.winfo_reqwidth() + self.px(22 + 10)
+                    self.reset_button.canvas.place(relx=1.0, rely=1.0, anchor='se', x=-gap, y=-self.px(18))
+                elif not show_reset and self.reset_shown:
+                    self.reset_button.canvas.place_forget()
+                self.reset_shown = show_reset
+                if show_reset:
+                    self.tk.Misc.lift(self.reset_button.canvas)
 
         def save_changes(self):
             self.collect()
@@ -974,6 +1054,8 @@ def launcher_class(base, ns):
             """Steam Deck mode on: the affected settings switch to the Deck's values (the previous ones
             are kept in deck_saved), the enforced ones are locked, the frame rate is 30 or 60 and the
             choices the Deck cannot run are greyed out. Off: the kept values come back."""
+            if getattr(self, '_resetting', False):
+                return  # reset_to_defaults sets the Deck values itself
             on = bool(self.var('steam_deck').get())
             saved = self.app.get('deck_saved')
             if on and not isinstance(saved, dict):
@@ -1086,7 +1168,7 @@ def launcher_class(base, ns):
             self._glow_frame = 0
 
         def show_version(self, text=None, fg=None):
-            self.version_label.configure(text=text or ns['VERSION'], fg=fg or MUTED)
+            self.version_label.configure(text=text or ns['VERSION'], fg=fg or MUTED, justify='left')
 
         def set_update_state(self, state, version=None):
             self.update_state = state
@@ -1108,10 +1190,59 @@ def launcher_class(base, ns):
             self.root.after(110, self.glow)
 
         def periodic_update_check(self):
-            """At launch and every 30 minutes while the launcher is open."""
+            """At launch and every 30 minutes while the launcher is open. A check that fails (no
+            network yet after the Steam Deck wakes, a GitHub timeout) is tried again after 15 s,
+            1 min and 5 min: before, it waited 30 minutes, and a new release showed only once the
+            download button was clicked. The window coming back to the front checks again when
+            the last check is 10 minutes old (a Deck that slept with the launcher open)."""
+            if not getattr(self, '_update_focus_bound', False):
+                self._update_focus_bound = True
+                self.root.bind('<FocusIn>', lambda _e: self.update_check_if_stale(), add='+')
             if self.app.get('check_updates', True) and self.update_state == 'none':
+                threading.Thread(target=self.scheduled_update_check, daemon=True).start()
+            else:
+                self.root.after(30 * 60 * 1000, self.periodic_update_check)
+
+        def scheduled_update_check(self):
+            """Helper thread: one check, then the next one scheduled (sooner after a failure)."""
+            retries = getattr(self, '_update_retries', 0)
+            if self.check_update():
+                self._update_retries, delay = 0, 30 * 60
+            else:
+                self._update_retries, delay = retries + 1, (15, 60, 300, 30 * 60)[min(retries, 3)]
+            self.ui_calls.put(lambda: self.root.after(delay * 1000, self.periodic_update_check))
+
+        def update_check_if_stale(self):
+            if (self.app.get('check_updates', True) and self.update_state == 'none' and
+                    time.time() - getattr(self, '_update_checked_at', 0) > 10 * 60 and
+                    not getattr(self, '_update_checking', False)):
                 threading.Thread(target=self.check_update, daemon=True).start()
-            self.root.after(30 * 60 * 1000, self.periodic_update_check)
+
+        def check_update(self, manual=False):
+            """Helper thread: the newest release of this fork, offered when it is newer; the
+            result goes to the launcher log. Returns whether GitHub answered."""
+            self._update_checking = True
+            try:
+                version, url, page, _notes = ns['latest_release']()
+            except (OSError, ValueError, KeyError) as failure:
+                uncharted_logs.note(f'Update check failed: {failure}')
+                if manual:
+                    self.ui_calls.put(lambda error=failure: self.messagebox.showerror(
+                        NAME, _('Could not check for updates: {}').format(error)))
+                return False
+            finally:
+                self._update_checking = False
+            self._update_checked_at = time.time()
+            newer = version_key(version) > version_key(ns['VERSION'])
+            uncharted_logs.note(f'Update check: newest {version}' + (' (offered)' if newer else ''))
+
+            def show():
+                if newer:
+                    self.offer_update(version, url, page)
+                elif manual:
+                    self.messagebox.showinfo(NAME, _('You have the latest version ({}).').format(ns['VERSION']))
+            self.ui_calls.put(show)
+            return True
 
         def update_clicked(self):
             if self.update_state == 'available':
@@ -1599,7 +1730,9 @@ def launcher_class(base, ns):
                 return
             self.update_url, self.update_page = url, page or ns['RELEASES_PAGE']
             self.set_update_state('available', version)
-            self.show_version(_('{} available').format(version), GOLD)
+            # Two lines: "0.3.11-linux.173 available" on one was wider than the sidebar's corner
+            # beside the two buttons, and was cut off.
+            self.show_version(_('Update available') + '\n' + version, GOLD)
 
         def restart_updated(self):
             if self.process:
