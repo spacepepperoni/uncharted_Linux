@@ -485,8 +485,10 @@ def default_saves(settings, data_dir=None):
 # the locked ones at launch); turning it off restores what the player had.
 DECK_SETTINGS = {'frame_rate': '30', 'window_size': '1280x800', 'present_mode': 'Fifo', 'fullscreen': True,
                  'anti_aliasing': 'off', 'frame_generation': 'off'}
-DECK_LOCKED = ('window_size', 'present_mode', 'fullscreen')
-DECK_FRAME_RATES = ('30', '60')  # 30 by default: the Deck does not hold 60 yet
+# The frame rate is locked too: Steam Deck mode caps the games at 30 FPS, which the Deck holds
+# (it did not hold 60, and a fresh install started at 60: the PC default was kept as a choice).
+DECK_LOCKED = ('window_size', 'present_mode', 'fullscreen', 'frame_rate')
+DECK_FRAME_RATES = ('30',)
 # Choices the Deck's hardware cannot run (an RDNA 2 GPU, a 60 Hz screen): greyed out in Steam
 # Deck mode, and replaced by these settings' first Deck-safe value at launch.
 DECK_UNAVAILABLE = {'anti_aliasing': ('fsr4', 'fsr411', 'dlss'), 'frame_generation': ('dlss',),
@@ -573,7 +575,7 @@ def update_environment(settings, env):
 
 
 def deck_environment(settings, env):
-    """Steam Deck mode: the Deck's screen and presentation, 30 or 60 FPS, and nothing its GPU
+    """Steam Deck mode: the Deck's screen and presentation, 30 FPS, and nothing its GPU
     cannot run. Applied before the player's own Environment entries, which can override any of it.
     The GPU readbacks choice was removed (Off made Uncharted 2's convoy unpassable, Precise hangs
     Uncharted 2 at startup), so a gpu_readbacks value saved by an older launcher is ignored."""
@@ -1052,7 +1054,7 @@ def launcher_class(base, ns):
 
         def steam_deck_changed(self, startup=False):
             """Steam Deck mode on: the affected settings switch to the Deck's values (the previous ones
-            are kept in deck_saved), the enforced ones are locked, the frame rate is 30 or 60 and the
+            are kept in deck_saved), the enforced ones are locked (the frame rate at 30) and the
             choices the Deck cannot run are greyed out. Off: the kept values come back."""
             if getattr(self, '_resetting', False):
                 return  # reset_to_defaults sets the Deck values itself
@@ -1061,8 +1063,6 @@ def launcher_class(base, ns):
             if on and not isinstance(saved, dict):
                 self.app['deck_saved'] = {key: self.var(key).get() for key in DECK_SETTINGS}
                 for key, value in DECK_SETTINGS.items():
-                    if key == 'frame_rate' and self.var(key).get() in DECK_FRAME_RATES:
-                        continue  # 30 or 60 already: the player's choice stays
                     self.var(key).set(value)
             elif not on and isinstance(saved, dict):
                 for key, value in saved.items():
@@ -1553,7 +1553,7 @@ def launcher_class(base, ns):
             self.page_inner[name] = f
             if name == 'display':
                 self.check(f, 'steam_deck', _('Steam Deck mode'),
-                           _('Optimizes settings for Steam Deck. 1280x800 60FPS'))
+                           _('Optimizes settings for Steam Deck. 1280x800 30FPS'))
             return f
 
         def build_play(self):

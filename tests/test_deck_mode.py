@@ -20,10 +20,12 @@ def environment(**settings):
 
 
 class DeckModeTests(unittest.TestCase):
-    def test_30_by_default_and_60_kept(self):
+    def test_capped_at_30(self):
         self.assertEqual(linux.DECK_SETTINGS['frame_rate'], '30')
         self.assertEqual(environment(steam_deck=True)['BB_VBLANK_HZ'], '30')
-        self.assertEqual(environment(steam_deck=True, frame_rate='60')['BB_VBLANK_HZ'], '60')
+        self.assertEqual(environment(steam_deck=True, frame_rate='60')['BB_VBLANK_HZ'], '30')
+        self.assertFalse(linux.deck_allows('frame_rate', '60'))
+        self.assertTrue(linux.deck_allows('frame_rate', '30'))
 
     def test_rates_above_60_fall_back_to_30(self):
         self.assertEqual(environment(steam_deck=True, frame_rate='144')['BB_VBLANK_HZ'], '30')
@@ -49,9 +51,8 @@ class DeckModeTests(unittest.TestCase):
         self.assertEqual(linux.update_highlights('No list here.\n- not this'), [])
         self.assertEqual(linux.update_highlights(None), [])
 
-    def test_frame_rate_is_not_locked(self):
-        self.assertNotIn('frame_rate', linux.DECK_LOCKED)
-        self.assertEqual(set(linux.DECK_LOCKED), {'window_size', 'present_mode', 'fullscreen'})
+    def test_frame_rate_is_locked(self):
+        self.assertEqual(set(linux.DECK_LOCKED), {'window_size', 'present_mode', 'fullscreen', 'frame_rate'})
 
     def test_options_the_deck_cannot_run_are_replaced(self):
         env = environment(steam_deck=True, anti_aliasing='dlss', frame_generation='dlss',
