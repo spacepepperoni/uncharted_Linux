@@ -416,8 +416,10 @@ def main():
     user_dir = Path(env.get('BB_USER_DIR', data / 'user')).resolve()
     user_dir.mkdir(parents=True, exist_ok=True)
     if not WINDOWS and env.get('BB_SAVEDATA_DIRS') is None:
-        env['BB_SAVEDATA_DIRS'] = ';'.join(f'{k}={v}' for k, v in SAVE_FOLDERS.items())
         split_saves(user_dir)
+        import save_slots   # each game's selected save slot (issue #71); slot 1 = SAVE_FOLDERS
+        env['BB_SAVEDATA_DIRS'] = save_slots.mapping(user_dir)
+        print(f"Saves: {env['BB_SAVEDATA_DIRS']}")
     # GPU caches (shaders, pipelines) beside the saves; read before main(), so set here.
     env.setdefault('BB_GPU_USER_DIR', str(user_dir))
     env.setdefault('BB_VBLANK_HZ', '60')

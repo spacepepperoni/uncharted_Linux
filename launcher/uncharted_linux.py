@@ -1482,34 +1482,100 @@ def launcher_class(base, ns):
             return super().toggle(parent, variable, background or ns['CARD'])
 
         def fill_saves(self):
+            """Each game's save slots (issue #71, scripts/save_slots.py): the selected one is what
+            Play and the Steam shortcut start with."""
             import datetime
+            import save_slots
             tk = self.tk
             for child in self.saves_rows.winfo_children():
                 child.destroy()
             base = self.saves_folder()
-            folders = (('Uncharted 1', GAMES[0][1]), ('Uncharted 2', GAMES[1][1]), ('Uncharted 3', GAMES[2][1]))
-            for r, (folder_name, title) in enumerate(folders):
-                folder = base / folder_name
-                saves = [d for d in folder.glob('SAVEDATA*') if d.is_dir() and not d.name.endswith('.sce_sys')] \
-                    if folder.is_dir() else []
-                if saves:
-                    newest = max(d.stat().st_mtime for d in saves)
-                    info = (_('1 save, last saved {}') if len(saves) == 1 else
-                            _('{} saves, last saved {}').replace('{}', str(len(saves)), 1)).format(
-                        datetime.datetime.fromtimestamp(newest).strftime('%Y-%m-%d %H:%M'))
-                else:
-                    info = _('No saves yet')
-                block = tk.Frame(self.saves_rows, bg=CARD)
-                block.grid(row=r, column=0, sticky='we', pady=(self.px(4) if r else 0, self.px(10)))
-                tk.Label(block, text=f'{folder_name}: {title}', bg=CARD, fg=TEXT,
-                         font=self.font_brand_md).grid(row=0, column=0, sticky='w')
-                tk.Label(block, text=str(folder), bg=CARD, fg=TEXT, font=self.font_ui_sm, justify='left',
-                         wraplength=self.px(560), anchor='w').grid(row=1, column=0, sticky='w')
-                tk.Label(block, text=info, bg=CARD, fg=MUTED, font=self.font_ui_sm).grid(
-                    row=2, column=0, sticky='w')
-                self.pill(block, _('Open'), lambda d=folder: (d.mkdir(parents=True, exist_ok=True), open_path(d)),
-                          padding=(14, 6)).grid(row=0, column=1, rowspan=3, sticky='e', padx=(self.px(24), 0))
-                block.columnconfigure(0, weight=1)
+            titles = dict(zip(save_slots.GAMES, (g[1] for g in GAMES)))
+            r = 0
+            for game in save_slots.GAMES:
+                head = tk.Frame(self.saves_rows, bg=CARD)
+                head.grid(row=r, column=0, sticky='we', pady=(self.px(10) if r else 0, self.px(2)))
+                r += 1
+                tk.Label(head, text=f'{game}: {titles[game]}', bg=CARD, fg=TEXT,
+                         font=self.font_brand_md).pack(side='left')
+                state = save_slots.load(base)
+                chosen = save_slots.selected(base, game, state)
+                for slot in save_slots.slots(base, game):
+                    text, when = save_slots.details(base, game, slot)
+                    label = _('Slot {}').format(slot)
+                    if save_slots.name(base, game, slot, state):
+                        label += f'  “{save_slots.name(base, game, slot, state)}”'
+                    info = (text + '  ·  ' if text else '') + (
+                        _('saved {}').format(datetime.datetime.fromtimestamp(when).strftime('%Y-%m-%d %H:%M'))
+                        if when else _('Empty: Play starts a new game'))
+                    block = tk.Frame(self.saves_rows, bg=CARD)
+                    block.grid(row=r, column=0, sticky='we', pady=(self.px(4), 0))
+                    r += 1
+                    mark = '●' if slot == chosen else '○'
+                    tk.Label(block, text=f'{mark}  {label}', bg=CARD, fg=GOLD if slot == chosen else TEXT,
+                             font=self.font_ui_sm).grid(row=0, column=0, sticky='w')
+                    tk.Label(block, text=info, bg=CARD, fg=MUTED, font=self.font_ui_sm, justify='left',
+                             wraplength=self.px(440), anchor='w').grid(row=1, column=0, sticky='w', padx=(self.px(18), 0))
+                    buttons = tk.Frame(block, bg=CARD)
+                    buttons.grid(row=0, column=1, rowspan=2, sticky='e', padx=(self.px(12), 0))
+                    if slot != chosen:
+                        self.pill(buttons, _('Use'), lambda g=game, n=slot: self.slot_action('use', g, n),
+                                  padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                    self.pill(buttons, _('Rename'), lambda g=game, n=slot: self.slot_action('rename', g, n),
+                              padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                    if when:
+                        self.pill(buttons, _('Copy to new slot'), lambda g=game, n=slot: self.slot_action('copy', g, n),
+                                  padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                    if when or slot != 1:
+                        self.pill(buttons, _('Delete'), lambda g=game, n=slot: self.slot_action('delete', g, n),
+                                  padding=(12, 5)).pack(side='left')
+                    block.columnconfigure(0, weight=1)
+                foot = tk.Frame(self.saves_rows, bg=CARD)
+                foot.grid(row=r, column=0, sticky='w', pady=(self.px(6), 0))
+                r += 1
+                if save_slots.first_free(base, game):
+                    self.pill(foot, _('New slot'), lambda g=game: self.slot_action('new', g, 0),
+                              padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                folder = save_slots.slot_dir(base, game, chosen)
+                self.pill(foot, _('Open folder'), lambda d=folder: (d.mkdir(parents=True, exist_ok=True), open_path(d)),
+                          padding=(12, 5)).pack(side='left')
+            self.saves_rows.columnconfigure(0, weight=1)
+
+        def slot_action(self, action, game, slot):
+            import save_slots
+            base = self.saves_folder()
+            if self.process and action != 'rename':
+                self.messagebox.showinfo(NAME, _('Close the game before changing save slots.'))
+                return
+            try:
+                if action == 'use':
+                    save_slots.select(base, game, slot)
+                elif action == 'new':
+                    free = save_slots.first_free(base, game)
+                    if free:
+                        save_slots.select(base, game, free)
+                elif action == 'copy':
+                    free = save_slots.first_free(base, game)
+                    if not free:
+                        self.messagebox.showinfo(NAME, _('All {} slots are in use.').format(save_slots.MOST))
+                        return
+                    save_slots.copy(base, game, slot, free)
+                    self.messagebox.showinfo(NAME, _('{}: slot {} copied to slot {}.').format(game, slot, free))
+                elif action == 'rename':
+                    from tkinter import simpledialog
+                    text = simpledialog.askstring(NAME, _('{}: name for slot {}').format(game, slot), parent=self.root,
+                                                  initialvalue=save_slots.name(base, game, slot))
+                    if text is None:
+                        return
+                    save_slots.rename(base, game, slot, text)
+                elif action == 'delete':
+                    if not self.messagebox.askyesno(NAME, _(
+                            '{}: delete the saves in slot {}? This cannot be undone.').format(game, slot)):
+                        return
+                    save_slots.delete(base, game, slot)
+            except OSError as error:
+                self.messagebox.showerror(NAME, _('Could not change the save slots: {}').format(error))
+            self.fill_saves()
 
         def show(self, name):
             super().show(name)
