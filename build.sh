@@ -103,6 +103,11 @@ if [[ ${1:-} == --test ]]; then
     out/runtime-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -Isrc tests/test_file_mods.c -o out/file-mods-test
     out/file-mods-test
+    # The .zar packer and reader (issue #70), with the vendored ZArchive sources.
+    "${CXX:-g++}" -std=c++20 -O1 -w -Igpu/third_party/zarchive/include -Isrc tests/test_zarchive.cpp gpu/shim/zarchive_bridge.cpp \
+        gpu/third_party/zarchive/src/zarchivereader.cpp gpu/third_party/zarchive/src/zarchivewriter.cpp \
+        -x c gpu/third_party/zarchive/src/sha_256.c -x none -lzstd -o out/zarchive-test
+    out/zarchive-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_sema.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/sema-test
     out/sema-test
     "$CC" -std=c11 -O2 -g -Wall -Wextra -Werror -pthread -I. -Isrc tests/test_ajm.c "${runtime[@]}" out/libatrac9.a -lm "${gpu[@]}" "${libraries[@]}" -o out/ajm-test

@@ -472,7 +472,12 @@ def apply_defaults(ns):
 
 
 def saves_for(game_dir):
-    return str(Path(game_dir) / 'Saves') if game_dir else ''
+    """<game folder>/Saves; for a packed game (game.zar, issue #70) game/Saves beside it, where the
+    saves were when the folder was packed."""
+    if not game_dir:
+        return ''
+    folder = Path(game_dir)
+    return str((folder.with_suffix('') if folder.suffix.lower() == '.zar' else folder) / 'Saves')
 
 
 def default_saves(settings, data_dir=None):
@@ -1359,6 +1364,7 @@ def launcher_class(base, ns):
             self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'),
                         _('Empty: a Saves folder in the game folder.'))
             self.build_pkg_install(f)
+            self.build_zar(f)
             self.section(f, _('Saves'))
             card = self.target(f)
             self.saves_rows = self.tk.Frame(card, bg=CARD)
@@ -1389,6 +1395,155 @@ def launcher_class(base, ns):
                                             justify='left')
             self.pkg_label.grid(row=self.next_row(card), column=1, sticky='w')
             self.pkg_busy = False
+
+        def build_zar(self, f):
+            """A packed game (.zar, issue #70): the game folder (and its title update) in one
+            compressed file that the game reads in place, about 10-15 GB smaller."""
+            holder = self.tk.Frame(self.target(f), bg=CARD)
+            self.zar_pack_button = self.pill(holder, _('Pack game…'), self.pack_zar, padding=(14, 6))
+            self.zar_pack_button.pack(side='left')
+            self.pill(holder, _('Choose .zar…'), self.choose_zar, padding=(14, 6)).pack(side='left', padx=(8, 0))
+            self.zar_trim_button = self.pill(holder, _('Remove unpacked files…'), self.trim_unpacked, padding=(14, 6))
+            self.zar_trim_button.pack(side='left', padx=(8, 0))
+            self.zar_progress = self.ttk.Progressbar(holder, length=self.px(160), maximum=1000)
+            self.zar_progress.pack(side='left', padx=(12, 0))
+            self.row(f, _('Packed game (.zar)'), holder,
+                     _('Packs the game folder and its update into one .zar beside it that the game reads '
+                       'directly (10-15 GB smaller). Then Remove unpacked files frees the space; '
+                       'your Saves folder stays.'))
+            card = self.target(f)
+            self.zar_label = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(560),
+                                            justify='left')
+            self.zar_label.grid(row=self.next_row(card), column=1, sticky='w')
+            self.zar_busy = False
+
+        def choose_zar(self):
+            current = self.var('game_dir').get()
+            chosen = self.filedialog.askopenfilename(
+                title=_('Choose the packed game'), filetypes=[(_('Packed game'), '*.zar'), (_('All files'), '*')],
+                initialdir=str(Path(current).parent) if current else str(Path.home()))
+            if chosen:
+                self.var('game_dir').set(str(Path(chosen)))
+
+        def unpacked_twin(self):
+            """(the .zar, its unpacked game folder beside it) when the game folder is a .zar."""
+            game = Path(self.var('game_dir').get() or '')
+            folder = game.with_suffix('')
+            if game.suffix.lower() == '.zar' and game.is_file() and (folder / 'eboot.bin').is_file():
+                return game, folder
+            return None
+
+        def pack_zar(self):
+            import zar_index
+            if self.zar_busy:
+                return
+            if self.process:
+                self.messagebox.showinfo(NAME, _('Close the game before packing it.'))
+                return
+            game = Path(self.var('game_dir').get() or '')
+            if zar_index.is_zar(game) or not (game / 'eboot.bin').is_file():
+                self.messagebox.showinfo(NAME, _('Choose the unpacked game folder (the one with eboot.bin) first.'))
+                return
+            probe = ns['controller_probe_path']()
+            if not probe:
+                self.messagebox.showerror(NAME, _('bb-probe was not found.'))
+                return
+            target = game.with_name(game.name + '.zar')
+            sources = [game]
+            update = str(self.var('update_dir').get() or '').strip()
+            candidates = [Path(update)] if update else \
+                [game.with_name(game.name + s) for s in ('-UPDATE', '-update', '-patch', '-PATCH')]
+            update = next((c for c in candidates if (c / 'sce_sys' / 'param.sfo').is_file()), None)
+            if update:
+                sources.append(update)
+            size = sum(p.stat().st_size for src in sources for p in src.rglob('*')
+                       if p.is_file() and not p.relative_to(src).parts[0].lower() == 'saves')
+            free = shutil.disk_usage(game.parent).free
+            if not self.messagebox.askyesno(NAME, _(
+                    'Pack {} into {}?\n\nThe game ({:.1f} GB{}) is compressed into one file, about 10-15 GB '
+                    'smaller; it takes a while (about 20-40 minutes on a Steam Deck). Free space on that '
+                    'drive: {:.1f} GB. The game folder is not changed.').format(
+                        game.name, target.name, size / 2**30,
+                        _(', with the update in {}').format(update.name) if update else '', free / 2**30)):
+                return
+            if free < size * 0.95:
+                self.messagebox.showerror(NAME, _('Not enough free space on that drive for the packed game.'))
+                return
+            saves = self.var('user_dir').get() or saves_for(str(game))
+            self.zar_busy = True
+            self.zar_pack_button.configure(state='disabled')
+            self.zar_label.configure(text=_('Packing…'))
+            command = [str(probe), '--zar-pack', str(target), '--skip', 'Saves', *map(str, sources)]
+
+            def work():
+                error = None
+                try:
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                               env=ns['controller_probe_environment'](probe), stdin=subprocess.DEVNULL)
+                    last = ''
+                    for line in process.stdout:
+                        line = line.strip()
+                        match = re.match(r'ZAR: packed (\d+) of (\d+) MB', line)
+                        if match:
+                            done, total = int(match[1]), max(int(match[2]), 1)
+                            self.ui_calls.put(lambda d=done, t=total: (
+                                self.zar_progress.configure(value=d * 1000 // t),
+                                self.zar_label.configure(text=_('Packing: {:.1f} of {:.1f} GB').format(d / 1024, t / 1024))))
+                        elif line:
+                            last = line
+                    if process.wait():
+                        error = last or _('the packer stopped (exit code {})').format(process.returncode)
+                except OSError as failure:
+                    error = str(failure)
+
+                def done():
+                    self.zar_busy = False
+                    self.zar_pack_button.configure(state='normal')
+                    if error:
+                        self.zar_label.configure(text=_('Packing stopped: {}').format(error))
+                        self.messagebox.showerror(NAME, _('Could not pack the game: {}').format(error))
+                        return
+                    self.zar_progress.configure(value=1000)
+                    self.var('user_dir').set(saves)   # the saves stay where they are
+                    self.var('game_dir').set(str(target))
+                    packed = target.stat().st_size
+                    self.zar_label.configure(text=_('Packed: {} ({:.1f} GB). The games now start from it.').format(
+                        target, packed / 2**30))
+                    self.messagebox.showinfo(NAME, _(
+                        'The game is packed ({:.1f} GB, {:.1f} GB smaller) and the games now start from {}.\n\n'
+                        'Play a little to check it works, then use Remove unpacked files to free the space.').format(
+                            packed / 2**30, (size - packed) / 2**30, target.name))
+                    self.refresh()
+                self.ui_calls.put(done)
+            threading.Thread(target=work, daemon=True).start()
+
+        def trim_unpacked(self):
+            """Deletes the unpacked game folder beside the .zar the games start from, except its Saves."""
+            twin = self.unpacked_twin()
+            if not twin:
+                self.messagebox.showinfo(NAME, _('Pack the game first: the games must start from the .zar, '
+                                                 'with the unpacked folder beside it.'))
+                return
+            if self.process:
+                self.messagebox.showinfo(NAME, _('Close the game first.'))
+                return
+            archive, folder = twin
+            saves = Path(self.var('user_dir').get() or saves_for(str(archive))).resolve()
+            # The Saves folder, and any folder holding the saves folder chosen in the launcher, stay.
+            doomed = [p for p in folder.iterdir() if p.name.lower() != 'saves'
+                      and not (saves == p.resolve() or p.resolve() in saves.parents)]
+            size = sum(f.stat().st_size for p in doomed for f in ([p] if p.is_file() else p.rglob('*')) if f.is_file())
+            if not self.messagebox.askyesno(NAME, _(
+                    'Delete the unpacked game in {} ({:.1f} GB)?\n\nThe games keep starting from {}. The Saves '
+                    'folder in it is kept. This cannot be undone.').format(folder, size / 2**30, archive.name)):
+                return
+            try:
+                for path in doomed:
+                    shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+            except OSError as error:
+                self.messagebox.showerror(NAME, _('Could not delete everything: {}').format(error))
+            self.zar_label.configure(text=_('Removed the unpacked game ({:.1f} GB).').format(size / 2**30))
+            self.refresh()
 
         def choose_pkg(self):
             if self.pkg_busy:
@@ -1860,7 +2015,7 @@ def launcher_class(base, ns):
                     try:  # library pictures: SteamGridDB's, else the player's own game folder's
                         import uncharted_art
                         if not uncharted_art.steamgriddb_artwork(key, config / 'grid', appid):
-                            uncharted_art.steam_artwork(self.app['game_dir'], config / 'grid', appid)
+                            uncharted_art.steam_artwork(ns['host_folder'](self.app['game_dir']), config / 'grid', appid)
                     except Exception:
                         pass
             except (OSError, ValueError) as error:
