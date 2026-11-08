@@ -5,9 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <cpuid.h>
 #include "runtime.h"
+#include "runtime_zarchive.h"
 #include "gpu/bbgpu.h"
 #ifdef _WIN32
 #include "red_zone.h"
@@ -478,12 +480,23 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     _exit(128 + sig);
 }
 #endif
-/* param.sfo lookup: string or integer value of key, 0 when absent. */
+/* param.sfo lookup: string or integer value of key, 0 when absent. A path under /app0/ is read
+ * through the guest file system (a packed .zar game, issue #70), others from the host. */
 static int sfo_value(const char *path, const char *key, char *text, size_t text_size, uint32_t *number) {
-    FILE *f=fopen(path,"rb");
-    if (!f) return 0;
     unsigned char data[65536];
-    size_t n=fread(data,1,sizeof(data),f); fclose(f);
+    size_t n=0;
+    if (!strncmp(path,"/app0/",6)) {
+        int fd=(int)runtime_file_open(path,0,0);
+        if (fd<0) return 0;
+        int64_t got=runtime_file_read(fd,data,sizeof(data));
+        runtime_file_close(fd);
+        if (got<=0) return 0;
+        n=(size_t)got;
+    } else {
+        FILE *f=fopen(path,"rb");
+        if (!f) return 0;
+        n=fread(data,1,sizeof(data),f); fclose(f);
+    }
     if (n<20 || memcmp(data,"\0PSF",4)) return 0;
     uint32_t keys, values, count;
     memcpy(&keys,data+8,4); memcpy(&values,data+12,4); memcpy(&count,data+16,4);
@@ -1237,6 +1250,49 @@ void runtime_restart(void) {
 #endif
 }
 
+/* --zar-extract <image.zar> <folder> <entry>...: the entries (files, or directories with all they
+ * hold) of a packed game written below the folder at their own paths, for run.py's preparation
+ * (the executables, sce_module, sce_sys) of a .zar game (issue #70). */
+static int zar_write(ZArchive *archive, int64_t node, const char *entry, const char *folder) {
+    char out[4096];
+    snprintf(out, sizeof(out), "%s/%s", folder, entry);
+    for (char *p = out + strlen(folder) + 1; *p; ++p)
+        if (*p == '/') { *p = 0; mkdir(out, 0755); *p = '/'; }
+    if (!zarchive_is_file(archive, node)) {
+        mkdir(out, 0755);
+        char name[512], child[4096];
+        int is_file = 0;
+        for (uint32_t i = 0; zarchive_child(archive, node, i, name, sizeof(name), &is_file); ++i) {
+            snprintf(child, sizeof(child), "%s/%s", entry, name);
+            int64_t n = zarchive_find(archive, child);
+            if (n == ZARCHIVE_NONE || zar_write(archive, n, child, folder)) return 1;
+        }
+        return 0;
+    }
+    FILE *f = fopen(out, "wb");
+    if (!f) { fprintf(stderr, "Cannot write %s\n", out); return 1; }
+    static unsigned char block[1 << 20];
+    const uint64_t size = zarchive_entry_size(archive, node);
+    for (uint64_t at = 0; at < size;) {
+        uint64_t n = zarchive_read(archive, node, at, block, sizeof(block));
+        if (!n || fwrite(block, 1, (size_t)n, f) != n) { fclose(f); fprintf(stderr, "Cannot extract %s\n", entry); return 1; }
+        at += n;
+    }
+    return fclose(f) ? 1 : 0;
+}
+static int zar_extract(int argc, char **argv) {
+    ZArchive *archive = zarchive_open(argv[2]);
+    if (!archive) { fprintf(stderr, "Cannot open %s: %s\n", argv[2], zarchive_error()); return 1; }
+    mkdir(argv[3], 0755);
+    int failed = 0;
+    for (int i = 4; i < argc && !failed; ++i) {
+        int64_t node = zarchive_find(archive, argv[i]);
+        if (node == ZARCHIVE_NONE) { printf("ZAR: no %s in %s\n", argv[i], argv[2]); continue; }
+        failed = zar_write(archive, node, argv[i], argv[3]);
+    }
+    zarchive_close(archive);
+    return failed;
+}
 int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifndef _WIN32
@@ -1246,6 +1302,17 @@ int main(int argc, char **argv) {
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
     if (argc == 2 && !strcmp(argv[1], "--vulkan-only")) return vulkan_smoke();
+    if (argc >= 5 && !strcmp(argv[1], "--zar-extract")) return zar_extract(argc, argv);
+    if (argc >= 4 && !strcmp(argv[1], "--zar-pack")) {
+        /* --zar-pack <out.zar> [--skip name]... <folder>...: the game (and its title update) packed */
+        const char *sources[8], *skip[8];
+        int sources_n=0, skip_n=0;
+        for (int i=3;i<argc;++i) {
+            if (!strcmp(argv[i],"--skip") && i+1<argc) { if (skip_n<8) skip[skip_n++]=argv[++i]; }
+            else if (sources_n<8) sources[sources_n++]=argv[i];
+        }
+        return sources_n ? zarchive_pack(sources,sources_n,skip,skip_n,argv[2]) : 1;
+    }
     if (argc == 2 && !strcmp(argv[1], "--controller-info")) return runtime_pad_tool(0,100);
     if (argc == 3 && !strcmp(argv[1], "--controller-test"))
         return runtime_pad_tool(1,atoi(argv[2]));
@@ -1297,7 +1364,7 @@ int main(int argc, char **argv) {
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
         char sfo[4096], id[16]="";
-        snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0);
+        snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",runtime_file_is_archive(app0) ? "/app0" : app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
             runtime_savedata_configure(id);
         char serial[16]="", title[128]="", version[16]="";
@@ -1452,7 +1519,7 @@ int main(int argc, char **argv) {
     if (!cpu_only) {
         char title[128]="Bloodborne", serial[16]="UNKNOWN", sfo[4096];
         uint32_t attributes=0;
-        snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
+        snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",!app0 ? "." : runtime_file_is_archive(app0) ? "/app0" : app0);
         sfo_value(sfo,"TITLE",title,sizeof(title),NULL);
         sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
         sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);

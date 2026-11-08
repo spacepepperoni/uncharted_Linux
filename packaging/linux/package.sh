@@ -21,7 +21,7 @@ icon.convert('RGBA').save('launcher/uncharted.png')
 EOF
 hidden=()
 for module in argparse base64 collections hashlib hmac json re shlex shutil struct tempfile zlib cheats xml.etree.ElementTree \
-              pkg_extract pkg_keys cryptography.hazmat.primitives.ciphers \
+              pkg_extract pkg_keys save_slots zar_index cryptography.hazmat.primitives.ciphers \
               uncharted_art uncharted_fonts uncharted_i18n uncharted_widgets uncharted_linux uncharted_logs bbport_steam PIL.ImageTk PIL._tkinter_finder; do
     hidden+=(--hidden-import "$module")
 done
@@ -65,7 +65,7 @@ ldd out/bb-probe out/gpu/libbbgpu.so out/bb-gpu-capabilities | awk '/=> \// {pri
     done
 cp scripts/prepare.py scripts/link_modules.py scripts/link_libc.py scripts/content_profile.py \
    scripts/render_720p.py scripts/render_res.py scripts/trophies.py scripts/cheats.py \
-   scripts/pkg_extract.py scripts/pkg_keys.py "$dest/scripts/"
+   scripts/pkg_extract.py scripts/pkg_keys.py scripts/save_slots.py scripts/zar_index.py "$dest/scripts/"
 cp run.py LICENSE "$dest/"
 cp launcher/uncharted.png "$dest/launcher/"
 cp README.md "$dest/README.md"

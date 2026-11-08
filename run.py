@@ -108,6 +108,33 @@ def split_saves(user_dir):
             print(f'Saves: moved {entry.name} to {target.parent.name}/')
 
 
+def zar_view(zar, exe, probe, out_root):
+    """Linux fork (issue #70): a game packed as a .zar (tools/make_zar.py) is read by the runtime in
+    place. What the preparation reads on the host (the executable, sce_module, sce_sys) is extracted
+    once into out/zar/<name>, and again when the .zar changes."""
+    import shutil
+    view = out_root / 'zar' / zar.stem
+    stamp = view / '.from'
+    info = zar.stat()
+    key = f'{zar.resolve()} {info.st_size} {info.st_mtime_ns}'
+    if not stamp.is_file() or stamp.read_text(encoding='utf-8', errors='replace') != key:
+        shutil.rmtree(view, ignore_errors=True)
+    wanted = [e for e in (exe, 'sce_module', 'sce_sys') if not (view / e).exists()]
+    if wanted:
+        print(f'ZAR: extracting {", ".join(wanted)} from {zar.name}', flush=True)
+        building = view.with_name(view.name + '.new')
+        shutil.rmtree(building, ignore_errors=True)
+        if subprocess.run([str(probe), '--zar-extract', str(zar), str(building), *wanted], stdin=subprocess.DEVNULL,
+                          creationflags=no_console()).returncode:
+            fail(f'Could not read {zar}: is it a .zar made from the game folder?')
+        view.mkdir(parents=True, exist_ok=True)
+        for entry in building.iterdir():
+            os.replace(entry, view / entry.name)
+        building.rmdir()
+        stamp.write_text(key, encoding='utf-8')
+    return view
+
+
 def unpack_pkg(pkg):
     """Linux fork: the game folder of a fake PKG, unpacked beside it on the first start (as in the
     MediEvil port); later starts reuse the folder."""
@@ -416,8 +443,10 @@ def main():
     user_dir = Path(env.get('BB_USER_DIR', data / 'user')).resolve()
     user_dir.mkdir(parents=True, exist_ok=True)
     if not WINDOWS and env.get('BB_SAVEDATA_DIRS') is None:
-        env['BB_SAVEDATA_DIRS'] = ';'.join(f'{k}={v}' for k, v in SAVE_FOLDERS.items())
         split_saves(user_dir)
+        import save_slots   # each game's selected save slot (issue #71); slot 1 = SAVE_FOLDERS
+        env['BB_SAVEDATA_DIRS'] = save_slots.mapping(user_dir)
+        print(f"Saves: {env['BB_SAVEDATA_DIRS']}")
     # GPU caches (shaders, pipelines) beside the saves; read before main(), so set here.
     env.setdefault('BB_GPU_USER_DIR', str(user_dir))
     env.setdefault('BB_VBLANK_HZ', '60')
@@ -483,8 +512,12 @@ def main():
         game, file = locate(env, exe)
         if not game:
             fail('Set BB_GAME_DIR to the game folder (the one with eboot.bin).')
-        if update := update_folder(env, game):  # Linux fork: title update 1.02 (issue #58)
-            game = merge_update(game, update, out_root / 'updated' / game.name)
+        app0 = game
+        if game.suffix.lower() == '.zar' and game.is_file():  # Linux fork: a packed game (issue #70)
+            game = zar_view(app0, file, probe, out_root)
+            print(f'Game: {app0} (packed; a title update is packed into it, tools/make_zar.py --update)')
+        elif update := update_folder(env, game):  # Linux fork: title update 1.02 (issue #58)
+            game = app0 = merge_update(game, update, out_root / 'updated' / game.name)
             print(f'Title update: {update}')
         if not (game / file).is_file():
             fail(f'No {file} in {game}.')
@@ -506,7 +539,7 @@ def main():
         patches = cheats.build(game / exe, out, [c for c in env['BB_CHEATS'].split(',') if c])
         env['BB_RESTART_COMMAND'] = (subprocess.list2cmdline if WINDOWS else shlex.join)([sys.executable, *this, '--after', str(os.getpid()), *args])
         command = [str(probe), str(image), '--content-profile', str(out / 'content.bin'),
-                   '--app0', str(game), '--user', str(user_dir), '--timeout', env.get('BB_TIMEOUT', '0')]
+                   '--app0', str(app0), '--user', str(user_dir), '--timeout', env.get('BB_TIMEOUT', '0')]
         if patches:
             command += ['--patches', str(patches)]
         if guest_argv:

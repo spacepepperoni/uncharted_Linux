@@ -472,7 +472,12 @@ def apply_defaults(ns):
 
 
 def saves_for(game_dir):
-    return str(Path(game_dir) / 'Saves') if game_dir else ''
+    """<game folder>/Saves; for a packed game (game.zar, issue #70) game/Saves beside it, where the
+    saves were when the folder was packed."""
+    if not game_dir:
+        return ''
+    folder = Path(game_dir)
+    return str((folder.with_suffix('') if folder.suffix.lower() == '.zar' else folder) / 'Saves')
 
 
 def default_saves(settings, data_dir=None):
@@ -485,8 +490,10 @@ def default_saves(settings, data_dir=None):
 # the locked ones at launch); turning it off restores what the player had.
 DECK_SETTINGS = {'frame_rate': '30', 'window_size': '1280x800', 'present_mode': 'Fifo', 'fullscreen': True,
                  'anti_aliasing': 'off', 'frame_generation': 'off'}
-DECK_LOCKED = ('window_size', 'present_mode', 'fullscreen')
-DECK_FRAME_RATES = ('30', '60')  # 30 by default: the Deck does not hold 60 yet
+# The frame rate is locked too: Steam Deck mode caps the games at 30 FPS, which the Deck holds
+# (it did not hold 60, and a fresh install started at 60: the PC default was kept as a choice).
+DECK_LOCKED = ('window_size', 'present_mode', 'fullscreen', 'frame_rate')
+DECK_FRAME_RATES = ('30',)
 # Choices the Deck's hardware cannot run (an RDNA 2 GPU, a 60 Hz screen): greyed out in Steam
 # Deck mode, and replaced by these settings' first Deck-safe value at launch.
 DECK_UNAVAILABLE = {'anti_aliasing': ('fsr4', 'fsr411', 'dlss'), 'frame_generation': ('dlss',),
@@ -504,6 +511,40 @@ ROW_HINTS = {'Frame rate': None,
              'Sharpness': 'For every upscaler, FSR 1 included (AMD RCAS)', 'Sharpening': None,
              'Anti-aliasing': None,
              'Frame generation': None, 'Multiplier': None, 'Mouse sensitivity': None}
+
+
+# What Reset to defaults keeps (issue #77): where the games, saves and title update are, the
+# player's name, pictures and Steam shortcut, the interface language and what the Library shows.
+# Setup, not settings: without them the games would not start.
+RESET_KEEPS = frozenset({'game_dir', 'game_dir_u1', 'game_dir_u2', 'game_dir_u3', 'user_dir',
+                         'update_dir', 'player_name', 'ui_language', 'start', 'trophy_game',
+                         'art_banner', 'art_u1', 'art_u2', 'art_u3', 'steam_art', 'art_crops',
+                         'shortcut_name', 'shortcut_icon'})
+
+
+def default_settings(defaults, default_pad):
+    """The settings Reset to defaults gives: the launcher's defaults, where Steam Deck mode is on
+    on a Steam Deck, and then Steam Deck mode's values on top."""
+    import copy
+    settings = {key: copy.deepcopy(value) for key, value in defaults.items() if key not in RESET_KEEPS}
+    if settings.get('steam_deck'):
+        settings.update(DECK_SETTINGS)
+    settings['pad_bindings'] = dict(default_pad)
+    settings['key_bindings'] = {}
+    return settings
+
+
+def differs_from_defaults(current, target):
+    """Whether any setting in `current` is not what Reset to defaults would give."""
+    for key, value in target.items():
+        now = current.get(key)
+        if key == 'key_bindings':
+            now = now or {}
+        elif key == 'pad_bindings':
+            now = {**value, **(now or {})}
+        if now != value:
+            return True
+    return False
 
 
 def unsaved_changes(saved, current):
@@ -539,7 +580,7 @@ def update_environment(settings, env):
 
 
 def deck_environment(settings, env):
-    """Steam Deck mode: the Deck's screen and presentation, 30 or 60 FPS, and nothing its GPU
+    """Steam Deck mode: the Deck's screen and presentation, 30 FPS, and nothing its GPU
     cannot run. Applied before the player's own Environment entries, which can override any of it.
     The GPU readbacks choice was removed (Off made Uncharted 2's convoy unpassable, Precise hangs
     Uncharted 2 at startup), so a gpu_readbacks value saved by an older launcher is ignored."""
@@ -892,9 +933,45 @@ def launcher_class(base, ns):
             self.save_button = PillButton(self.tk, right, _('Save changes'), self.save_changes, ns['COLORS'],
                                           self.px, self.font_button, 'primary', SURFACE, (20, 8))
             self.save_button.canvas.place(relx=1.0, rely=1.0, anchor='se', x=-self.px(22), y=-self.px(18))
+            # Reset to defaults, left of it, while any setting differs from its default (#77).
+            self.reset_button = PillButton(self.tk, right, _('Reset to defaults'), self.reset_to_defaults,
+                                           ns['COLORS'], self.px, self.font_button, 'ghost', SURFACE, (16, 8))
+            self.reset_shown = False
             for var in list(self.vars.values()) + list((getattr(self, 'pad_vars', None) or {}).values()):
                 var.trace_add('write', lambda *_a: self.after_setting_change())
             self.saved_settings = self.settings_now()
+            self.after_setting_change()
+
+        def reset_target(self):
+            return default_settings(ns['APP_DEFAULTS'], ns['DEFAULT_PAD'])
+
+        def reset_to_defaults(self):
+            """Every setting back to its default (RESET_KEEPS stay). On a Steam Deck, Steam Deck
+            mode stays on with its values; turning it off then gives the PC defaults. Saved by Save
+            changes, like any other change."""
+            target = self.reset_target()
+            self._resetting = True  # steam_deck_changed would keep the old values and save
+            try:
+                for key, value in target.items():
+                    if key in ('key_bindings', 'pad_bindings'):
+                        continue
+                    if key in self.vars:
+                        self.var(key).set(value)
+                    else:
+                        self.app[key] = value
+            finally:
+                self._resetting = False
+            if target.get('steam_deck'):
+                self.app['deck_saved'] = {key: ns['APP_DEFAULTS'][key] for key in DECK_SETTINGS}
+            else:
+                self.app.pop('deck_saved', None)
+            for key in DECK_LOCKED:
+                box = getattr(self, 'boxes', {}).get(key)
+                if box is not None:
+                    box.configure(state='disabled' if target.get('steam_deck') else 'readonly')
+            self.reset_keys()
+            if getattr(self, 'pad_vars', None):
+                self.reset_pad()
             self.after_setting_change()
 
         def var(self, key):
@@ -912,9 +989,19 @@ def launcher_class(base, ns):
 
         def after_setting_change(self):
             if hasattr(self, 'saved_settings'):
-                changed = unsaved_changes(self.saved_settings, self.settings_now())
+                now = self.settings_now()
+                changed = unsaved_changes(self.saved_settings, now)
                 self.save_button.configure(state='normal' if changed else 'disabled')
                 self.tk.Misc.lift(self.save_button.canvas)  # Canvas.lift raises drawn items
+                show_reset = differs_from_defaults(now, self.reset_target())
+                if show_reset and not self.reset_shown:
+                    gap = self.save_button.canvas.winfo_reqwidth() + self.px(22 + 10)
+                    self.reset_button.canvas.place(relx=1.0, rely=1.0, anchor='se', x=-gap, y=-self.px(18))
+                elif not show_reset and self.reset_shown:
+                    self.reset_button.canvas.place_forget()
+                self.reset_shown = show_reset
+                if show_reset:
+                    self.tk.Misc.lift(self.reset_button.canvas)
 
         def save_changes(self):
             self.collect()
@@ -972,15 +1059,15 @@ def launcher_class(base, ns):
 
         def steam_deck_changed(self, startup=False):
             """Steam Deck mode on: the affected settings switch to the Deck's values (the previous ones
-            are kept in deck_saved), the enforced ones are locked, the frame rate is 30 or 60 and the
+            are kept in deck_saved), the enforced ones are locked (the frame rate at 30) and the
             choices the Deck cannot run are greyed out. Off: the kept values come back."""
+            if getattr(self, '_resetting', False):
+                return  # reset_to_defaults sets the Deck values itself
             on = bool(self.var('steam_deck').get())
             saved = self.app.get('deck_saved')
             if on and not isinstance(saved, dict):
                 self.app['deck_saved'] = {key: self.var(key).get() for key in DECK_SETTINGS}
                 for key, value in DECK_SETTINGS.items():
-                    if key == 'frame_rate' and self.var(key).get() in DECK_FRAME_RATES:
-                        continue  # 30 or 60 already: the player's choice stays
                     self.var(key).set(value)
             elif not on and isinstance(saved, dict):
                 for key, value in saved.items():
@@ -1086,7 +1173,7 @@ def launcher_class(base, ns):
             self._glow_frame = 0
 
         def show_version(self, text=None, fg=None):
-            self.version_label.configure(text=text or ns['VERSION'], fg=fg or MUTED)
+            self.version_label.configure(text=text or ns['VERSION'], fg=fg or MUTED, justify='left')
 
         def set_update_state(self, state, version=None):
             self.update_state = state
@@ -1108,10 +1195,59 @@ def launcher_class(base, ns):
             self.root.after(110, self.glow)
 
         def periodic_update_check(self):
-            """At launch and every 30 minutes while the launcher is open."""
+            """At launch and every 30 minutes while the launcher is open. A check that fails (no
+            network yet after the Steam Deck wakes, a GitHub timeout) is tried again after 15 s,
+            1 min and 5 min: before, it waited 30 minutes, and a new release showed only once the
+            download button was clicked. The window coming back to the front checks again when
+            the last check is 10 minutes old (a Deck that slept with the launcher open)."""
+            if not getattr(self, '_update_focus_bound', False):
+                self._update_focus_bound = True
+                self.root.bind('<FocusIn>', lambda _e: self.update_check_if_stale(), add='+')
             if self.app.get('check_updates', True) and self.update_state == 'none':
+                threading.Thread(target=self.scheduled_update_check, daemon=True).start()
+            else:
+                self.root.after(30 * 60 * 1000, self.periodic_update_check)
+
+        def scheduled_update_check(self):
+            """Helper thread: one check, then the next one scheduled (sooner after a failure)."""
+            retries = getattr(self, '_update_retries', 0)
+            if self.check_update():
+                self._update_retries, delay = 0, 30 * 60
+            else:
+                self._update_retries, delay = retries + 1, (15, 60, 300, 30 * 60)[min(retries, 3)]
+            self.ui_calls.put(lambda: self.root.after(delay * 1000, self.periodic_update_check))
+
+        def update_check_if_stale(self):
+            if (self.app.get('check_updates', True) and self.update_state == 'none' and
+                    time.time() - getattr(self, '_update_checked_at', 0) > 10 * 60 and
+                    not getattr(self, '_update_checking', False)):
                 threading.Thread(target=self.check_update, daemon=True).start()
-            self.root.after(30 * 60 * 1000, self.periodic_update_check)
+
+        def check_update(self, manual=False):
+            """Helper thread: the newest release of this fork, offered when it is newer; the
+            result goes to the launcher log. Returns whether GitHub answered."""
+            self._update_checking = True
+            try:
+                version, url, page, _notes = ns['latest_release']()
+            except (OSError, ValueError, KeyError) as failure:
+                uncharted_logs.note(f'Update check failed: {failure}')
+                if manual:
+                    self.ui_calls.put(lambda error=failure: self.messagebox.showerror(
+                        NAME, _('Could not check for updates: {}').format(error)))
+                return False
+            finally:
+                self._update_checking = False
+            self._update_checked_at = time.time()
+            newer = version_key(version) > version_key(ns['VERSION'])
+            uncharted_logs.note(f'Update check: newest {version}' + (' (offered)' if newer else ''))
+
+            def show():
+                if newer:
+                    self.offer_update(version, url, page)
+                elif manual:
+                    self.messagebox.showinfo(NAME, _('You have the latest version ({}).').format(ns['VERSION']))
+            self.ui_calls.put(show)
+            return True
 
         def update_clicked(self):
             if self.update_state == 'available':
@@ -1228,6 +1364,7 @@ def launcher_class(base, ns):
             self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'),
                         _('Empty: a Saves folder in the game folder.'))
             self.build_pkg_install(f)
+            self.build_zar(f)
             self.section(f, _('Saves'))
             card = self.target(f)
             self.saves_rows = self.tk.Frame(card, bg=CARD)
@@ -1258,6 +1395,155 @@ def launcher_class(base, ns):
                                             justify='left')
             self.pkg_label.grid(row=self.next_row(card), column=1, sticky='w')
             self.pkg_busy = False
+
+        def build_zar(self, f):
+            """A packed game (.zar, issue #70): the game folder (and its title update) in one
+            compressed file that the game reads in place, about 10-15 GB smaller."""
+            holder = self.tk.Frame(self.target(f), bg=CARD)
+            self.zar_pack_button = self.pill(holder, _('Pack game…'), self.pack_zar, padding=(14, 6))
+            self.zar_pack_button.pack(side='left')
+            self.pill(holder, _('Choose .zar…'), self.choose_zar, padding=(14, 6)).pack(side='left', padx=(8, 0))
+            self.zar_trim_button = self.pill(holder, _('Remove unpacked files…'), self.trim_unpacked, padding=(14, 6))
+            self.zar_trim_button.pack(side='left', padx=(8, 0))
+            self.zar_progress = self.ttk.Progressbar(holder, length=self.px(160), maximum=1000)
+            self.zar_progress.pack(side='left', padx=(12, 0))
+            self.row(f, _('Packed game (.zar)'), holder,
+                     _('Packs the game folder and its update into one .zar beside it that the game reads '
+                       'directly (10-15 GB smaller). Then Remove unpacked files frees the space; '
+                       'your Saves folder stays.'))
+            card = self.target(f)
+            self.zar_label = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(560),
+                                            justify='left')
+            self.zar_label.grid(row=self.next_row(card), column=1, sticky='w')
+            self.zar_busy = False
+
+        def choose_zar(self):
+            current = self.var('game_dir').get()
+            chosen = self.filedialog.askopenfilename(
+                title=_('Choose the packed game'), filetypes=[(_('Packed game'), '*.zar'), (_('All files'), '*')],
+                initialdir=str(Path(current).parent) if current else str(Path.home()))
+            if chosen:
+                self.var('game_dir').set(str(Path(chosen)))
+
+        def unpacked_twin(self):
+            """(the .zar, its unpacked game folder beside it) when the game folder is a .zar."""
+            game = Path(self.var('game_dir').get() or '')
+            folder = game.with_suffix('')
+            if game.suffix.lower() == '.zar' and game.is_file() and (folder / 'eboot.bin').is_file():
+                return game, folder
+            return None
+
+        def pack_zar(self):
+            import zar_index
+            if self.zar_busy:
+                return
+            if self.process:
+                self.messagebox.showinfo(NAME, _('Close the game before packing it.'))
+                return
+            game = Path(self.var('game_dir').get() or '')
+            if zar_index.is_zar(game) or not (game / 'eboot.bin').is_file():
+                self.messagebox.showinfo(NAME, _('Choose the unpacked game folder (the one with eboot.bin) first.'))
+                return
+            probe = ns['controller_probe_path']()
+            if not probe:
+                self.messagebox.showerror(NAME, _('bb-probe was not found.'))
+                return
+            target = game.with_name(game.name + '.zar')
+            sources = [game]
+            update = str(self.var('update_dir').get() or '').strip()
+            candidates = [Path(update)] if update else \
+                [game.with_name(game.name + s) for s in ('-UPDATE', '-update', '-patch', '-PATCH')]
+            update = next((c for c in candidates if (c / 'sce_sys' / 'param.sfo').is_file()), None)
+            if update:
+                sources.append(update)
+            size = sum(p.stat().st_size for src in sources for p in src.rglob('*')
+                       if p.is_file() and not p.relative_to(src).parts[0].lower() == 'saves')
+            free = shutil.disk_usage(game.parent).free
+            if not self.messagebox.askyesno(NAME, _(
+                    'Pack {} into {}?\n\nThe game ({:.1f} GB{}) is compressed into one file, about 10-15 GB '
+                    'smaller; it takes a while (about 20-40 minutes on a Steam Deck). Free space on that '
+                    'drive: {:.1f} GB. The game folder is not changed.').format(
+                        game.name, target.name, size / 2**30,
+                        _(', with the update in {}').format(update.name) if update else '', free / 2**30)):
+                return
+            if free < size * 0.95:
+                self.messagebox.showerror(NAME, _('Not enough free space on that drive for the packed game.'))
+                return
+            saves = self.var('user_dir').get() or saves_for(str(game))
+            self.zar_busy = True
+            self.zar_pack_button.configure(state='disabled')
+            self.zar_label.configure(text=_('Packing…'))
+            command = [str(probe), '--zar-pack', str(target), '--skip', 'Saves', *map(str, sources)]
+
+            def work():
+                error = None
+                try:
+                    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                               env=ns['controller_probe_environment'](probe), stdin=subprocess.DEVNULL)
+                    last = ''
+                    for line in process.stdout:
+                        line = line.strip()
+                        match = re.match(r'ZAR: packed (\d+) of (\d+) MB', line)
+                        if match:
+                            done, total = int(match[1]), max(int(match[2]), 1)
+                            self.ui_calls.put(lambda d=done, t=total: (
+                                self.zar_progress.configure(value=d * 1000 // t),
+                                self.zar_label.configure(text=_('Packing: {:.1f} of {:.1f} GB').format(d / 1024, t / 1024))))
+                        elif line:
+                            last = line
+                    if process.wait():
+                        error = last or _('the packer stopped (exit code {})').format(process.returncode)
+                except OSError as failure:
+                    error = str(failure)
+
+                def done():
+                    self.zar_busy = False
+                    self.zar_pack_button.configure(state='normal')
+                    if error:
+                        self.zar_label.configure(text=_('Packing stopped: {}').format(error))
+                        self.messagebox.showerror(NAME, _('Could not pack the game: {}').format(error))
+                        return
+                    self.zar_progress.configure(value=1000)
+                    self.var('user_dir').set(saves)   # the saves stay where they are
+                    self.var('game_dir').set(str(target))
+                    packed = target.stat().st_size
+                    self.zar_label.configure(text=_('Packed: {} ({:.1f} GB). The games now start from it.').format(
+                        target, packed / 2**30))
+                    self.messagebox.showinfo(NAME, _(
+                        'The game is packed ({:.1f} GB, {:.1f} GB smaller) and the games now start from {}.\n\n'
+                        'Play a little to check it works, then use Remove unpacked files to free the space.').format(
+                            packed / 2**30, (size - packed) / 2**30, target.name))
+                    self.refresh()
+                self.ui_calls.put(done)
+            threading.Thread(target=work, daemon=True).start()
+
+        def trim_unpacked(self):
+            """Deletes the unpacked game folder beside the .zar the games start from, except its Saves."""
+            twin = self.unpacked_twin()
+            if not twin:
+                self.messagebox.showinfo(NAME, _('Pack the game first: the games must start from the .zar, '
+                                                 'with the unpacked folder beside it.'))
+                return
+            if self.process:
+                self.messagebox.showinfo(NAME, _('Close the game first.'))
+                return
+            archive, folder = twin
+            saves = Path(self.var('user_dir').get() or saves_for(str(archive))).resolve()
+            # The Saves folder, and any folder holding the saves folder chosen in the launcher, stay.
+            doomed = [p for p in folder.iterdir() if p.name.lower() != 'saves'
+                      and not (saves == p.resolve() or p.resolve() in saves.parents)]
+            size = sum(f.stat().st_size for p in doomed for f in ([p] if p.is_file() else p.rglob('*')) if f.is_file())
+            if not self.messagebox.askyesno(NAME, _(
+                    'Delete the unpacked game in {} ({:.1f} GB)?\n\nThe games keep starting from {}. The Saves '
+                    'folder in it is kept. This cannot be undone.').format(folder, size / 2**30, archive.name)):
+                return
+            try:
+                for path in doomed:
+                    shutil.rmtree(path) if path.is_dir() and not path.is_symlink() else path.unlink()
+            except OSError as error:
+                self.messagebox.showerror(NAME, _('Could not delete everything: {}').format(error))
+            self.zar_label.configure(text=_('Removed the unpacked game ({:.1f} GB).').format(size / 2**30))
+            self.refresh()
 
         def choose_pkg(self):
             if self.pkg_busy:
@@ -1351,34 +1637,100 @@ def launcher_class(base, ns):
             return super().toggle(parent, variable, background or ns['CARD'])
 
         def fill_saves(self):
+            """Each game's save slots (issue #71, scripts/save_slots.py): the selected one is what
+            Play and the Steam shortcut start with."""
             import datetime
+            import save_slots
             tk = self.tk
             for child in self.saves_rows.winfo_children():
                 child.destroy()
             base = self.saves_folder()
-            folders = (('Uncharted 1', GAMES[0][1]), ('Uncharted 2', GAMES[1][1]), ('Uncharted 3', GAMES[2][1]))
-            for r, (folder_name, title) in enumerate(folders):
-                folder = base / folder_name
-                saves = [d for d in folder.glob('SAVEDATA*') if d.is_dir() and not d.name.endswith('.sce_sys')] \
-                    if folder.is_dir() else []
-                if saves:
-                    newest = max(d.stat().st_mtime for d in saves)
-                    info = (_('1 save, last saved {}') if len(saves) == 1 else
-                            _('{} saves, last saved {}').replace('{}', str(len(saves)), 1)).format(
-                        datetime.datetime.fromtimestamp(newest).strftime('%Y-%m-%d %H:%M'))
-                else:
-                    info = _('No saves yet')
-                block = tk.Frame(self.saves_rows, bg=CARD)
-                block.grid(row=r, column=0, sticky='we', pady=(self.px(4) if r else 0, self.px(10)))
-                tk.Label(block, text=f'{folder_name}: {title}', bg=CARD, fg=TEXT,
-                         font=self.font_brand_md).grid(row=0, column=0, sticky='w')
-                tk.Label(block, text=str(folder), bg=CARD, fg=TEXT, font=self.font_ui_sm, justify='left',
-                         wraplength=self.px(560), anchor='w').grid(row=1, column=0, sticky='w')
-                tk.Label(block, text=info, bg=CARD, fg=MUTED, font=self.font_ui_sm).grid(
-                    row=2, column=0, sticky='w')
-                self.pill(block, _('Open'), lambda d=folder: (d.mkdir(parents=True, exist_ok=True), open_path(d)),
-                          padding=(14, 6)).grid(row=0, column=1, rowspan=3, sticky='e', padx=(self.px(24), 0))
-                block.columnconfigure(0, weight=1)
+            titles = dict(zip(save_slots.GAMES, (g[1] for g in GAMES)))
+            r = 0
+            for game in save_slots.GAMES:
+                head = tk.Frame(self.saves_rows, bg=CARD)
+                head.grid(row=r, column=0, sticky='we', pady=(self.px(10) if r else 0, self.px(2)))
+                r += 1
+                tk.Label(head, text=f'{game}: {titles[game]}', bg=CARD, fg=TEXT,
+                         font=self.font_brand_md).pack(side='left')
+                state = save_slots.load(base)
+                chosen = save_slots.selected(base, game, state)
+                for slot in save_slots.slots(base, game):
+                    text, when = save_slots.details(base, game, slot)
+                    label = _('Slot {}').format(slot)
+                    if save_slots.name(base, game, slot, state):
+                        label += f'  “{save_slots.name(base, game, slot, state)}”'
+                    info = (text + '  ·  ' if text else '') + (
+                        _('saved {}').format(datetime.datetime.fromtimestamp(when).strftime('%Y-%m-%d %H:%M'))
+                        if when else _('Empty: Play starts a new game'))
+                    block = tk.Frame(self.saves_rows, bg=CARD)
+                    block.grid(row=r, column=0, sticky='we', pady=(self.px(4), 0))
+                    r += 1
+                    mark = '●' if slot == chosen else '○'
+                    tk.Label(block, text=f'{mark}  {label}', bg=CARD, fg=GOLD if slot == chosen else TEXT,
+                             font=self.font_ui_sm).grid(row=0, column=0, sticky='w')
+                    tk.Label(block, text=info, bg=CARD, fg=MUTED, font=self.font_ui_sm, justify='left',
+                             wraplength=self.px(440), anchor='w').grid(row=1, column=0, sticky='w', padx=(self.px(18), 0))
+                    buttons = tk.Frame(block, bg=CARD)
+                    buttons.grid(row=0, column=1, rowspan=2, sticky='e', padx=(self.px(12), 0))
+                    if slot != chosen:
+                        self.pill(buttons, _('Use'), lambda g=game, n=slot: self.slot_action('use', g, n),
+                                  padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                    self.pill(buttons, _('Rename'), lambda g=game, n=slot: self.slot_action('rename', g, n),
+                              padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                    if when:
+                        self.pill(buttons, _('Copy to new slot'), lambda g=game, n=slot: self.slot_action('copy', g, n),
+                                  padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                    if when or slot != 1:
+                        self.pill(buttons, _('Delete'), lambda g=game, n=slot: self.slot_action('delete', g, n),
+                                  padding=(12, 5)).pack(side='left')
+                    block.columnconfigure(0, weight=1)
+                foot = tk.Frame(self.saves_rows, bg=CARD)
+                foot.grid(row=r, column=0, sticky='w', pady=(self.px(6), 0))
+                r += 1
+                if save_slots.first_free(base, game):
+                    self.pill(foot, _('New slot'), lambda g=game: self.slot_action('new', g, 0),
+                              padding=(12, 5)).pack(side='left', padx=(0, self.px(6)))
+                folder = save_slots.slot_dir(base, game, chosen)
+                self.pill(foot, _('Open folder'), lambda d=folder: (d.mkdir(parents=True, exist_ok=True), open_path(d)),
+                          padding=(12, 5)).pack(side='left')
+            self.saves_rows.columnconfigure(0, weight=1)
+
+        def slot_action(self, action, game, slot):
+            import save_slots
+            base = self.saves_folder()
+            if self.process and action != 'rename':
+                self.messagebox.showinfo(NAME, _('Close the game before changing save slots.'))
+                return
+            try:
+                if action == 'use':
+                    save_slots.select(base, game, slot)
+                elif action == 'new':
+                    free = save_slots.first_free(base, game)
+                    if free:
+                        save_slots.select(base, game, free)
+                elif action == 'copy':
+                    free = save_slots.first_free(base, game)
+                    if not free:
+                        self.messagebox.showinfo(NAME, _('All {} slots are in use.').format(save_slots.MOST))
+                        return
+                    save_slots.copy(base, game, slot, free)
+                    self.messagebox.showinfo(NAME, _('{}: slot {} copied to slot {}.').format(game, slot, free))
+                elif action == 'rename':
+                    from tkinter import simpledialog
+                    text = simpledialog.askstring(NAME, _('{}: name for slot {}').format(game, slot), parent=self.root,
+                                                  initialvalue=save_slots.name(base, game, slot))
+                    if text is None:
+                        return
+                    save_slots.rename(base, game, slot, text)
+                elif action == 'delete':
+                    if not self.messagebox.askyesno(NAME, _(
+                            '{}: delete the saves in slot {}? This cannot be undone.').format(game, slot)):
+                        return
+                    save_slots.delete(base, game, slot)
+            except OSError as error:
+                self.messagebox.showerror(NAME, _('Could not change the save slots: {}').format(error))
+            self.fill_saves()
 
         def show(self, name):
             super().show(name)
@@ -1422,7 +1774,7 @@ def launcher_class(base, ns):
             self.page_inner[name] = f
             if name == 'display':
                 self.check(f, 'steam_deck', _('Steam Deck mode'),
-                           _('Optimizes settings for Steam Deck. 1280x800 60FPS'))
+                           _('Optimizes settings for Steam Deck. 1280x800 30FPS'))
             return f
 
         def build_play(self):
@@ -1599,7 +1951,9 @@ def launcher_class(base, ns):
                 return
             self.update_url, self.update_page = url, page or ns['RELEASES_PAGE']
             self.set_update_state('available', version)
-            self.show_version(_('{} available').format(version), GOLD)
+            # Two lines: "0.3.11-linux.173 available" on one was wider than the sidebar's corner
+            # beside the two buttons, and was cut off.
+            self.show_version(_('Update available') + '\n' + version, GOLD)
 
         def restart_updated(self):
             if self.process:
@@ -1661,7 +2015,7 @@ def launcher_class(base, ns):
                     try:  # library pictures: SteamGridDB's, else the player's own game folder's
                         import uncharted_art
                         if not uncharted_art.steamgriddb_artwork(key, config / 'grid', appid):
-                            uncharted_art.steam_artwork(self.app['game_dir'], config / 'grid', appid)
+                            uncharted_art.steam_artwork(ns['host_folder'](self.app['game_dir']), config / 'grid', appid)
                     except Exception:
                         pass
             except (OSError, ValueError) as error:

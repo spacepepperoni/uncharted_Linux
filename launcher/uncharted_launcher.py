@@ -346,7 +346,13 @@ def set_ini(key, value):
 
 
 def game_info(folder):
-    """{'title', 'id', 'version', 'games': [keys present]} of a game folder, or None."""
+    """{'title', 'id', 'version', 'games': [keys present]} of a game folder, or None. A packed game
+    (.zar, Linux fork issue #70) is listed from its file tree; its title stays 'Uncharted'."""
+    import zar_index
+    if zar_index.is_zar(folder):
+        root = zar_index.root_entries(folder) or {}
+        games = [key for key, _n, _s, exe in GAMES if root.get(exe.lower(), ('', False))[1]]
+        return {'title': 'Uncharted', 'id': Path(folder).stem, 'version': '?', 'games': games} if games else None
     folder = Path(folder or '.')
     if not any((folder / exe).is_file() for _k, _t, _s, exe in GAMES):
         return None
@@ -367,6 +373,15 @@ def game_folder(s, key):
     return str(s.get(f'game_dir_{key}') or '').strip() or str(s.get('game_dir') or '').strip()
 
 
+def host_folder(folder):
+    """Where the launcher reads a game's own files (trophy packs, pictures): the folder, or for a
+    packed game (.zar, Linux fork issue #70) what run.py extracted from it, once it has started."""
+    if folder and Path(folder).suffix.lower() == '.zar':
+        view = DATA_DIR / 'out' / 'zar' / Path(folder).stem
+        return str(view) if view.is_dir() else folder
+    return folder
+
+
 def game_available(s, key):
     """The game's executable is in its folder (a game dumped on its own may have it as eboot.bin)."""
     folder = game_folder(s, key)
@@ -374,6 +389,10 @@ def game_available(s, key):
         return False
     exe = next(e for k, _t, _s, e in GAMES if k == key)
     own = str(s.get(f'game_dir_{key}') or '').strip()
+    import zar_index
+    if zar_index.is_zar(folder):   # a packed game (Linux fork, issue #70)
+        root = zar_index.root_entries(folder) or {}
+        return any(root.get(name.lower(), ('', False))[1] for name in (exe, *(['eboot.bin'] if own else [])))
     return (Path(folder) / exe).is_file() or bool(own and (Path(folder) / 'eboot.bin').is_file())
 
 
@@ -1377,7 +1396,7 @@ class Launcher:
         try:
             from PIL import Image, ImageTk
             import uncharted_art
-            art = uncharted_art.cover(game_dir)
+            art = uncharted_art.cover(host_folder(game_dir))
             return ImageTk.PhotoImage(art.resize((side, side), Image.LANCZOS)) if art else None
         except Exception:
             return None
@@ -1713,7 +1732,7 @@ class Launcher:
         """The trophy list of one game (texts in the console language), made from its trophy pack in
         the game folder when it is not there yet; None without a pack."""
         s = self.current()
-        folder = game_folder(s, key)
+        folder = host_folder(game_folder(s, key))
         if not folder:
             return None
         stem = next(exe for k, _t, _s, exe in GAMES if k == key)
@@ -2044,7 +2063,7 @@ class Launcher:
             return
         self.collect()
         folder = game_folder(self.app, self.app['start'])
-        if not folder or not Path(folder).is_dir():
+        if not folder or not (Path(folder).is_dir() or Path(folder).suffix.lower() == '.zar' and Path(folder).is_file()):
             self.messagebox.showerror(NAME, _('Choose the game folder with eboot.bin.'))
             self.show('game')
             return
