@@ -139,7 +139,17 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     puts(entered_game ? "Original guest entry instructions executed; game initialization is incomplete." :
                         "Native libc initialization is incomplete; game entry has not run.");
     fflush(NULL);
-    _exit(20); /* no destructors: GPU, audio and guest threads are still running */
+    runtime_quit(20); /* no destructors: GPU, audio and guest threads are still running */
+}
+void runtime_quit(int code) {
+    static volatile long quitting;
+    fflush(NULL);
+    if (!__atomic_exchange_n(&quitting,1,__ATOMIC_ACQ_REL) && gpu_enabled) bbgpu_prepare_exit();
+    fflush(NULL);
+#ifdef _WIN32
+    TerminateProcess(GetCurrentProcess(),(UINT)code);
+#endif
+    _exit(code);
 }
 #ifndef _WIN32
 /* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
@@ -224,6 +234,66 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     }
     snprintf(out,size,"%p",(void *)address);
 }
+/* An address in committed executable memory (a return address candidate). */
+static int executable_address(uintptr_t address) {
+    MEMORY_BASIC_INFORMATION m;
+    if (address<0x10000 || !VirtualQuery((const void *)address,&m,sizeof(m)) || m.State!=MEM_COMMIT) return 0;
+    return (m.Protect&(PAGE_EXECUTE|PAGE_EXECUTE_READ|PAGE_EXECUTE_READWRITE|PAGE_EXECUTE_WRITECOPY))!=0;
+}
+/* After the report: the stack as a list of addresses in executable memory (return address
+ * candidates, not a verified call chain: rbp is not a frame pointer in drivers and optimised
+ * host code, and a call to a bad pointer leaves only [rsp]). Bounded by the TEB stack (fibers
+ * set it to their own) and by what can be read. */
+static void scan_stack(uintptr_t sp) {
+    uintptr_t top, limit; /* NT_TIB StackBase, StackLimit (gs:[8], gs:[16]; NtCurrentTeb trips -Warray-bounds) */
+    __asm__ volatile("mov %%gs:8,%0\n mov %%gs:16,%1" : "=r"(top), "=r"(limit));
+    if (sp<limit || sp>=top || top-sp>32768) top=sp+32768;
+    char where[MAX_PATH+64];
+    uintptr_t last=0;
+    int shown=0;
+    for (uintptr_t at=sp&~(uintptr_t)7; at<top && shown<24; at+=8) {
+        uint64_t value;
+        SIZE_T got=0;
+        if (!ReadProcessMemory(GetCurrentProcess(),(const void *)at,&value,sizeof(value),&got) || got!=sizeof(value)) break;
+        if (value==last || !executable_address((uintptr_t)value)) continue;
+        describe_address(where,sizeof(where),(uintptr_t)value);
+        fprintf(stderr,"  stack+0x%04" PRIxPTR " %s\n",at-sp,where);
+        last=value; ++shown;
+    }
+}
+/* user/crash.dmp (threads, modules, stacks and the memory they point at): a later crash can be
+ * read with a debugger. dbghelp is loaded at start (not in a crashed process); the dump is
+ * written by a helper thread that gets 15 s: a lock held by the faulting code (heap, loader)
+ * then costs the dump, never a hung process. BB_NO_CRASH_DUMP=1: none. */
+typedef BOOL (WINAPI *MiniDumpWriteDumpFn)(HANDLE,DWORD,HANDLE,int,const void *,const void *,const void *);
+static MiniDumpWriteDumpFn crash_dump_write;
+static char crash_dump_path[MAX_PATH];
+static struct { DWORD thread; EXCEPTION_POINTERS *pointers; BOOL client; } crash_exception;
+static void crash_dump_configure(const char *user) {
+    if (getenv("BB_NO_CRASH_DUMP")) return;
+    snprintf(crash_dump_path,sizeof(crash_dump_path),"%s\\crash.dmp",user);
+    HMODULE dbghelp=LoadLibraryA("dbghelp.dll");
+    if (dbghelp) crash_dump_write=(MiniDumpWriteDumpFn)(void *)GetProcAddress(dbghelp,"MiniDumpWriteDump");
+}
+static DWORD WINAPI crash_dump_thread(void *unused) {
+    (void)unused;
+    HANDLE file=CreateFileA(crash_dump_path,GENERIC_WRITE,0,NULL,CREATE_ALWAYS,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (file==INVALID_HANDLE_VALUE) return 1;
+    /* MiniDumpWithIndirectlyReferencedMemory | WithUnloadedModules | WithProcessThreadData |
+     * WithThreadInfo: no full memory (the guest maps gigabytes). */
+    const BOOL ok=crash_dump_write(GetCurrentProcess(),GetCurrentProcessId(),file,0x40|0x20|0x100|0x1000,&crash_exception,NULL,NULL);
+    CloseHandle(file);
+    return ok ? 0 : 2;
+}
+static void write_crash_dump(EXCEPTION_POINTERS *info) {
+    if (!crash_dump_write) return;
+    crash_exception.thread=GetCurrentThreadId(); crash_exception.pointers=info; crash_exception.client=FALSE;
+    HANDLE helper=CreateThread(NULL,0,crash_dump_thread,NULL,0,NULL);
+    DWORD code=3;
+    if (helper && WaitForSingleObject(helper,15000)==WAIT_OBJECT_0) GetExitCodeThread(helper,&code);
+    if (code==0) fprintf(stderr,"Crash dump: %s\n",crash_dump_path);
+    else fprintf(stderr,"Crash dump: not written (%s)\n",code==1 ? "cannot create the file" : code==2 ? "dbghelp failed" : "timed out");
+}
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -231,12 +301,17 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     const CONTEXT *c=info->ContextRecord;
     char where[MAX_PATH+64];
     describe_address(where,sizeof(where),(uintptr_t)c->Rip);
+    char thread[96];
+    const char *guest=runtime_thread_name_here(), *fiber=runtime_fiber_name_here();
+    if (fiber) snprintf(thread,sizeof(thread),"thread %lu '%s', fiber '%s'",GetCurrentThreadId(),guest ? guest : "?",fiber);
+    else if (guest) snprintf(thread,sizeof(thread),"thread %lu '%s'",GetCurrentThreadId(),guest);
+    else snprintf(thread,sizeof(thread),"thread %lu, host",GetCurrentThreadId());
     if (record->ExceptionCode==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2)
-        fprintf(stderr,"Fault: %s access to %p at %s (thread %lu)\n",
+        fprintf(stderr,"Fault: %s access to %p at %s (%s)\n",
                 record->ExceptionInformation[0]==1 ? "write" : record->ExceptionInformation[0]==8 ? "execute" : "read",
-                (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
+                (void *)record->ExceptionInformation[1],where,thread);
     else
-        fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
+        fprintf(stderr,"Fault: exception 0x%08lx at %s (%s)\n",record->ExceptionCode,where,thread);
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
@@ -250,6 +325,17 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"  #%d %s\n",depth,where);
         rbp=frame[0];
     }
+    {
+        uint64_t slot;
+        SIZE_T got=0;
+        if (ReadProcessMemory(GetCurrentProcess(),(const void *)(uintptr_t)c->Rsp,&slot,sizeof(slot),&got) && got==sizeof(slot)) {
+            describe_address(where,sizeof(where),(uintptr_t)slot);
+            fprintf(stderr,"  [rsp] %s%s\n",where,executable_address((uintptr_t)slot) ? "" : " (not code)");
+        }
+    }
+    scan_stack((uintptr_t)c->Rsp);
+    fflush(NULL);
+    write_crash_dump(info);
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -854,10 +940,13 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
     unsigned char *thunks=NULL;
     int thunk_failed=0;
     size_t used=0;
-    uint8_t installed[32]={0};
-    uint64_t hook_offsets[32]; size_t hooks_done=0;
+    /* Sized from the table, so no entry is dropped for room (a fixed 32 used to cut the table's end
+     * without a word, and 8 KiB of thunks about 25 hooks). */
+    const size_t thunk_bytes=(count ? count : 1)*320;
+    uint8_t installed[count ? count : 1];
+    uint64_t hook_offsets[count ? count : 1]; size_t hooks_done=0;
+    memset(installed,0,sizeof(installed));
     guest_image_size=image_size;
-    if (count>sizeof(installed)) count=sizeof(installed);
     /* A/B tests: BB_CALLBACKS=0 installs none, BB_CALLBACKS_SKIP=<text> none whose name contains the text */
     const char *off=getenv("BB_CALLBACKS"), *skip=getenv("BB_CALLBACKS_SKIP");
     if (off && off[0]=='0') { printf("Callbacks: disabled (BB_CALLBACKS=0)\n"); return; }
@@ -872,19 +961,19 @@ static void install_game_callbacks(Segment *segments, uint64_t ns, uint64_t imag
         int hooked=0;
         for (size_t j=0;j<hooks_done;++j) if (hook_offsets[j]==offset) hooked=1;
         if (hooked) continue;                                          /* an earlier entry took this site */
-        if (hooks_done<sizeof(hook_offsets)/sizeof(*hook_offsets)) hook_offsets[hooks_done++]=offset;
+        hook_offsets[hooks_done++]=offset;
         if (!c->callback) {
             memcpy(image+offset,c->patch,c->moved);
             installed[i]=1;
             printf("Callbacks: %s at %#" PRIx64 " (patch)\n",c->name,offset);
             continue;
         }
-        if (!thunks && !thunk_failed && !(thunks=near_image_memory(8192))) {
-            printf("Callbacks: no thunk memory\n");
+        if (!thunks && !thunk_failed && !(thunks=near_image_memory(thunk_bytes))) {
+            printf("Callbacks: no thunk memory near the image: %s and the hooks after it not installed\n",c->name);
             thunk_failed=1; /* Linux fork: the plain patches below still apply */
         }
         if (!thunks) continue;
-        if (used+320>8192) break;
+        if (used+320>thunk_bytes) { printf("Callbacks: thunk memory full at %s, the rest not installed\n",c->name); break; }
         unsigned char *t=thunks+used, *f=image+offset;
         size_t k=0;
         /* pushfq; push rax rcx rdx r8-r11 rbx r12 r13 r15 (the RuntimeGuestRegs block); mov rbx, rsp;
@@ -1213,6 +1302,47 @@ static void patch_job_sleep(uint64_t image_size) {
         return;
     }
 }
+/* The engine's job runner copies a descriptor it reaches through the job's record
+ * (mov rax, [r10+8]; mov rcx, [rax+0x20]); a job run before its descriptor was set read address 0x20
+ * and the game stopped (BilalReloaded's port 0.8.0, its #205 #304 #326, all three games). From
+ * Mevlock's dev builds: before the two loads a jump goes to a stub in the function's dead assert path
+ * (it keeps its int 0x41 first); a null pointer ends the job at the function's own exit, otherwise the
+ * loads run and it jumps back. 1.02 code (US CUSA02320, EU/Russian CUSA02344, EU 1.02): the same bytes
+ * in those dumps. Both sites are found by their exact bytes and patched only together, at the distance
+ * the jumps were made for (1.00 is compiled differently and is left alone). BB_JOB_GUARD=0: off. */
+static void patch_job_descriptor_guard(uint64_t image_size) {
+    const char *env=getenv("BB_JOB_GUARD");
+    if (env && env[0]=='0') return;
+    static const struct {
+        const char *game, *loads, *cave;
+        unsigned char jump[27], stub[24];
+        int64_t distance;
+    } builds[]={
+        {"U1","49c7424800000000488b05a4b6b80049894210498b4208488b4820","488b05efe6a9004885c07427488d3d2ce91e00488d35c4e7",
+         {0x49,0xc7,0x42,0x48,0x00,0x00,0x00,0x00,0x48,0x8b,0x05,0xa4,0xb6,0xb8,0x00,0x49,0x89,0x42,0x10,0xe9,0xff,0x0a,0x00,0x00,0x90,0x90,0x90},
+         {0xcd,0x41,0x49,0x8b,0x42,0x08,0x48,0x85,0xc0,0x0f,0x84,0x9a,0xff,0xff,0xff,0x48,0x8b,0x48,0x20,0xe9,0xee,0xf4,0xff,0xff},0xb15},
+        {"U2","49c7424800000000488b0514e4940049894210498b4208488b4820","488b05618484004885c07427488d3dfa731800488d35ef71",
+         {0x49,0xc7,0x42,0x48,0x00,0x00,0x00,0x00,0x48,0x8b,0x05,0x14,0xe4,0x94,0x00,0x49,0x89,0x42,0x10,0xe9,0xfd,0x0a,0x00,0x00,0x90,0x90,0x90},
+         {0xcd,0x41,0x49,0x8b,0x42,0x08,0x48,0x85,0xc0,0x0f,0x84,0x9a,0xff,0xff,0xff,0x48,0x8b,0x48,0x20,0xe9,0xf0,0xf4,0xff,0xff},0xb13},
+        {"U3","49c7424800000000488b05c4c3d60049894210498b4208488b4820","488b05418dc6004885c07427488d3d08414f00488d35fd3e",
+         {0x49,0xc7,0x42,0x48,0x00,0x00,0x00,0x00,0x48,0x8b,0x05,0xc4,0xc3,0xd6,0x00,0x49,0x89,0x42,0x10,0xe9,0xfd,0x0a,0x00,0x00,0x90,0x90,0x90},
+         {0xcd,0x41,0x49,0x8b,0x42,0x08,0x48,0x85,0xc0,0x0f,0x84,0x9a,0xff,0xff,0xff,0x48,0x8b,0x48,0x20,0xe9,0xf0,0xf4,0xff,0xff},0xb13},
+    };
+    for (size_t b=0;b<sizeof(builds)/sizeof(*builds);++b) {
+        const int64_t loads=find_unique_pattern(image_size,builds[b].loads);
+        if (loads<0) continue;
+        const int64_t cave=find_unique_pattern(image_size,builds[b].cave);
+        if (cave-loads!=builds[b].distance) {
+            printf("Job descriptor guard: %s 1.02 loads found, its stub site not where expected; not patched\n",builds[b].game);
+            return;
+        }
+        memcpy(image+cave,builds[b].stub,sizeof(builds[b].stub));
+        memcpy(image+loads,builds[b].jump,sizeof(builds[b].jump));
+        printf("Job descriptor guard: %s 1.02 job runner skips a job without its descriptor (%#" PRIx64 ", stub %#" PRIx64 ")\n",
+               builds[b].game,(uint64_t)loads,(uint64_t)cave);
+        return;
+    }
+}
 /* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
  * applied at start). Descriptors are closed first so the old GPU device and its memory are
  * released before the new process opens its own. */
@@ -1283,7 +1413,12 @@ static int zar_write(ZArchive *archive, int64_t node, const char *entry, const c
 static int zar_extract(int argc, char **argv) {
     ZArchive *archive = zarchive_open(argv[2]);
     if (!archive) { fprintf(stderr, "Cannot open %s: %s\n", argv[2], zarchive_error()); return 1; }
-    mkdir(argv[3], 0755);
+    /* (with the folders above it: out/zar is not there before the first .zar game, issue #80) */
+    char folder[4096];
+    snprintf(folder, sizeof(folder), "%s", argv[3]);
+    for (char *p = folder + 1; *p; ++p)
+        if (*p == '/') { *p = 0; mkdir(folder, 0755); *p = '/'; }
+    mkdir(folder, 0755);
     int failed = 0;
     for (int i = 4; i < argc && !failed; ++i) {
         int64_t node = zarchive_find(archive, argv[i]);
@@ -1363,6 +1498,9 @@ int main(int argc, char **argv) {
     }
     if (app0) {
         runtime_file_configure(app0, user_dir ? user_dir : "user");
+#ifdef _WIN32
+        crash_dump_configure(user_dir ? user_dir : "user");
+#endif
         char sfo[4096], id[16]="";
         snprintf(sfo,sizeof(sfo),"%s/sce_sys/param.sfo",runtime_file_is_archive(app0) ? "/app0" : app0);
         if (sfo_value(sfo,"INSTALL_DIR_SAVEDATA",id,sizeof(id),NULL) || sfo_value(sfo,"TITLE_ID",id,sizeof(id),NULL))
@@ -1514,6 +1652,9 @@ int main(int argc, char **argv) {
     }
     image = runtime_image_map(round_page(size), PROT_READ | PROT_WRITE);
     if (!image) image = allocate(round_page(size));
+#ifdef _WIN32
+    red_zone_reserve(image, round_page(size)); /* before bbgpu_init: the driver's allocations may fill its reach */
+#endif
     if (fread(image, 1, size, f) != size || fgetc(f) != EOF) fail("incorrect memory image size");
     fclose(f);
     if (!cpu_only) {
@@ -1569,6 +1710,7 @@ int main(int argc, char **argv) {
         patch_job_sleep(image_end);
         patch_job_lock_wait(image_end);
         runtime_display_patch(image, image_end);
+        patch_job_descriptor_guard(image_end);
     }
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));

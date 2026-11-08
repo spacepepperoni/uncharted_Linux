@@ -28,6 +28,7 @@ import sys
 PORT = Path(__file__).resolve().parent
 sys.path.insert(0, str(PORT / 'scripts'))
 import cheats
+from prepare import collection_folder
 EXECUTABLES = {'u1': 'eboot.bin', 'u2': 'big2-ps4_Shipping.elf', 'u3': 'big3-ps4_Shipping.elf'}
 LOADEXEC_EXIT = 101  # runtime_services.c: the game asked for another executable
 WINDOWS = sys.platform == 'win32'
@@ -124,6 +125,7 @@ def zar_view(zar, exe, probe, out_root):
         print(f'ZAR: extracting {", ".join(wanted)} from {zar.name}', flush=True)
         building = view.with_name(view.name + '.new')
         shutil.rmtree(building, ignore_errors=True)
+        building.parent.mkdir(parents=True, exist_ok=True)   # (out/zar: not there before the first .zar game, issue #80)
         if subprocess.run([str(probe), '--zar-extract', str(zar), str(building), *wanted], stdin=subprocess.DEVNULL,
                           creationflags=no_console()).returncode:
             fail(f'Could not read {zar}: is it a .zar made from the game folder?')
@@ -169,7 +171,10 @@ def locate(env, name):
     if not folder:
         return None, name
     folder = Path(folder)
-    if own and not (folder / name).is_file() and (folder / 'eboot.bin').is_file():
+    # Not in a collection folder: there eboot.bin is Uncharted 1, and an incomplete dump without
+    # big2/big3 started Uncharted 1 on half its files (a player's log, 2026-11-01).
+    if own and not (folder / name).is_file() and (folder / 'eboot.bin').is_file() \
+            and not collection_folder(folder):
         name = 'eboot.bin'
     return folder, name
 
@@ -410,9 +415,9 @@ def main():
     env.setdefault('BB_VELOCITY_PS', 'f4b18264')
     env.setdefault('BB_UPSCALE_BEFORE_CS', 'aec539f0')
     env.setdefault('BB_HUDLESS_PS', '484cdbf5')
-    # Full-screen passes that rebuild positions from the jittered scene depth get the upscaler's
-    # jitter too: the sun shadow pass (without it its shadows flickered under FSR and TAA).
-    env.setdefault('BB_JITTER_PS', 'f614041e')
+    # These passes need the scene's jitter too: sun shadow reconstruction, U1 boat details,
+    # and U3 London bar surfaces drawn against secondary scene depth (otherwise they flicker).
+    env.setdefault('BB_JITTER_PS', 'f614041e,b2a42acf,1a08df2d')
     if not env.get('BB_FSR411_DIR') and not (PORT / 'fsr4_411').is_dir() and (data / 'fsr4_411').is_dir():
         env['BB_FSR411_DIR'] = str(data / 'fsr4_411')
 
@@ -520,7 +525,8 @@ def main():
             game = app0 = merge_update(game, update, out_root / 'updated' / game.name)
             print(f'Title update: {update}')
         if not (game / file).is_file():
-            fail(f'No {file} in {game}.')
+            fail(f'No {file} in {game}: the game dump is incomplete (extract the game again) or the wrong folder '
+                 'is chosen for this game.')
         out = out_root / Path(exe).stem.split('-')[0]
         prepare(game, file, out)
         image = render_resolution(env, exe, out, out / 'boot-linked.bin')

@@ -704,6 +704,27 @@ static void __attribute__((ms_abi)) ndgi_end(uint64_t rdi, uint64_t rsi, uint64_
 /* The camera code, the pad code and the assertion are found by their instructions, so a build of the
  * game that has them works (version 1.00 and 1.02 are known; "build" below). RIP-relative
  * displacements and call targets are wildcards. Entries with one name are variants for the builds. */
+/* U3, London Underground (issue #81): the title-screen music played on into the level after Continue at
+ * the chapter's low-intensity checkpoint. The menu playlist survives level loads, loops, and has no tempo;
+ * the level queues its playlist 0x0c3dd4f5 to switch at the current track's next musical boundary, which
+ * the music manager (NdMusicManager update) finds with fmodf(position, beat length): with no tempo that is
+ * NaN, so the boundary never comes and the menu theme plays on. Only for that pending playlist, and only
+ * while the playing track has no tempo, its copy in the manager is set to switch at once (as a chapter
+ * start's music does). rbx is the manager: +0x2f5 a playlist is pending, +0x224 its id, +0x22f its
+ * flags (4: wait for a boundary), +0x180 the playing track's beat length. BB_CALLBACKS_SKIP=menu off. */
+static void __attribute__((ms_abi)) u3_menu_music_into_level(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
+                                                              const RuntimeGuestRegs *regs) {
+    (void)rdi; (void)rsi; (void)image; (void)r14;
+    unsigned char *manager=(unsigned char *)(uintptr_t)regs->rbx;
+    if (!manager[0x2f5] || !(manager[0x22f] & 4)) return;
+    uint32_t pending; float beat;
+    memcpy(&pending,manager+0x224,4); memcpy(&beat,manager+0x180,4);
+    if (pending!=0x0c3dd4f5u || beat!=0.0f) return;
+    manager[0x22f]&=(unsigned char)~4;
+    static int told;
+    if (!told) { told=1; printf("U3 music: the London Underground music replaces the title music (issue #81)\n"); }
+}
+
 static const RuntimeGuestCallback guest_callbacks[]={
     /* U1 follow camera, build 100 */
     {"U1 follow camera (mouse)",
@@ -873,6 +894,11 @@ static const RuntimeGuestCallback guest_callbacks[]={
       "8d 35 ?? ?? ?? ?? 48 8d 15 ?? ?? ?? ?? 48 8d 0d ?? ?? ?? ?? "
       "41 b8 4d 04 00 00 45 31 c9 ff d0 cd 41 c5 f8 28 45 d0",
       0x0, 58, NULL, u2_focus_reset_102},
+    /* U3 title music into the London Underground level (issue #81), build 102: cmp byte [rbx+0x2f5],0; je;
+     * test byte [rbx+0x22f],4; sete al; or al,r15b; jne (NdMusicManager update, pending playlist switch) */
+    {"U3 menu music into London Underground",
+      "80 bb f5 02 00 00 00 74 61 f6 83 2f 02 00 00 04 0f 94 c0 44 08 f8 75 0a",
+      0x0, 7, u3_menu_music_into_level, NULL},
     /* Render context Begin, build 100: mov [r12+0xe810], rax */
     {"Job render context begin", "49 89 84 24 10 e8 00 00", 0x0, 8, ndgi_begin, NULL},
     /* build 102: mov [r15+0xe810], r12 */

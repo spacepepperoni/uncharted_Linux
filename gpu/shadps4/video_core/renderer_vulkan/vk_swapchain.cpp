@@ -45,6 +45,9 @@ void Swapchain::Create(u32 width_, u32 height_) {
     const vk::SwapchainKHR old_swapchain = swapchain;
     swapchain = nullptr;
     Destroy();
+    // RefreshSemaphores sizes the semaphores to the new image count: a smaller count left
+    // frame_index past their end (from BilalReloaded's port 0.8.0).
+    image_index = frame_index = 0;
 
     SetSurfaceProperties();
 
@@ -213,6 +216,8 @@ void Swapchain::FindPresentMode() {
         present_mode = vk::PresentModeKHR::eMailbox;
     } else if (requested_mode == "Fifo") {
         present_mode = vk::PresentModeKHR::eFifo;
+    } else if (requested_mode == "FifoRelaxed") {   // (Linux fork: the launcher's FIFO Relaxed choice)
+        present_mode = vk::PresentModeKHR::eFifoRelaxed;
     } else if (requested_mode == "Immediate") {
         present_mode = vk::PresentModeKHR::eImmediate;
     } else {

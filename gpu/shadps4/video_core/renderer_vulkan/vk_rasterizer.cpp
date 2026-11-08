@@ -664,7 +664,18 @@ void Rasterizer::NotePendingGpuWrite(VAddr address, u64 size) {
         return;
     }
     // Draws write the same buffers over and over: an entry for the range only moves on.
-    const u64 position = draw_pipe->Head();
+    // bbport (Mevlock, U2 chapter 1 train flash): Head() is where the packet being prepared
+    // starts, and Reached(Head()) holds as soon as the packet before it has run. A write noted by
+    // PostDraw before its packet is committed (a draw's or dispatch's written resources) counted
+    // as done while that packet had not run: a copy shader the recording thread runs on the CPU
+    // wrote a material constant after stage A had walked the resource tables holding it into a
+    // later draw, and the train's platform flashed white for a frame. One past the start: done
+    // once this packet has run. BB_PENDING_NOTE_FIX=0: as before.
+    static const bool note_fix = [] {
+        const char* env = std::getenv("BB_PENDING_NOTE_FIX");
+        return !(env && env[0] == '0');
+    }();
+    const u64 position = draw_pipe->Head() + (note_fix && notes_before_commit ? 1 : 0);
     const VAddr end = address + size;
     for (auto& write : pending_writes) {
         if (address <= write.end && write.begin <= end) {
@@ -801,6 +812,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     u32 num_stages = 0;
     u32 size = sizeof(DrawPacket) + AlignPacket(num_blocks * sizeof(u16)) +
                num_blocks * AmdGpu::RegDirty::BlockWords * sizeof(u32);
+    notes_before_commit = true;
     for (const auto* stage : stages) {
         if (stage) {
             auto& ring = rings[num_stages];
@@ -907,6 +919,7 @@ void Rasterizer::PostDraw(const Pipeline* pipeline, const PreparedDraw* used_pre
     }
     dirty.Clear();
     draw_pipe->Commit(static_cast<u32>(out - start));
+    notes_before_commit = false;
     PrintPipeStats();
 }
 
@@ -3768,9 +3781,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                     const auto new_layout = image.info.props.is_depth
                                                 ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
                                                 : vk::ImageLayout::eShaderReadOnlyOptimal;
-                    barrier |= runtime.Transit(
-                        &image, new_layout, vk::PipelineStageFlagBits2::eAllCommands,
-                        vk::AccessFlagBits2::eShaderRead, desc.view_info.range);
+                    // bbport: a depth image sampled while it is this draw's depth target keeps the
+                    // attachment's stages and accesses in its state: recorded as a shader read only,
+                    // the render pass's depth/stencil store was lost to the next barrier, which then
+                    // waited for shader reads alone (sync validation: WRITE_AFTER_WRITE on the layout
+                    // transition after vkCmdEndRendering, READ_AFTER_WRITE on the next pass's depth
+                    // load; U3's 1720x720 half-resolution depth at 3440x1440, every frame).
+                    // BB_DEPTH_TARGET_STATE=0: as before (A/B).
+                    static const bool depth_target_state = [] {
+                        const char* env = std::getenv("BB_DEPTH_TARGET_STATE");
+                        return !(env && env[0] == '0');
+                    }();
+                    const bool depth_target = depth_target_state && image.info.props.is_depth && binding.is_target;
+                    const auto stage = depth_target
+                                           ? vk::PipelineStageFlagBits2::eAllCommands |
+                                                 vk::PipelineStageFlagBits2::eEarlyFragmentTests |
+                                                 vk::PipelineStageFlagBits2::eLateFragmentTests
+                                           : vk::PipelineStageFlags2(vk::PipelineStageFlagBits2::eAllCommands);
+                    const auto access = depth_target
+                                            ? vk::AccessFlagBits2::eShaderRead |
+                                                  vk::AccessFlagBits2::eDepthStencilAttachmentRead |
+                                                  vk::AccessFlagBits2::eDepthStencilAttachmentWrite
+                                            : vk::AccessFlags2(vk::AccessFlagBits2::eShaderRead);
+                    barrier |= runtime.Transit(&image, new_layout, stage, access, desc.view_info.range);
                 }
             }
             image.usage.storage |= is_storage;
@@ -3984,6 +4017,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         signature = MakeBeginSignature(pipeline);
         const auto& regs = Regs();
         bool usable = begin_memo.valid && scheduler.IsRenderingWith(begin_memo.state) &&
+                      begin_memo.meta_clears == texture_cache.MetaClears() &&
                       !regs.depth_render_control.depth_clear_enable &&
                       !regs.depth_render_control.stencil_clear_enable &&
                       signature == begin_memo.signature;
@@ -4014,7 +4048,7 @@ RenderState Rasterizer::BeginRendering(const GraphicsPipeline* pipeline) {
         if (!clears) {
             // Recomputed after the full path: it may have started the scene (scene_started).
             begin_memo = {true, MakeBeginSignature(pipeline), state, push_data.scene_size,
-                          target_scale};
+                          target_scale, texture_cache.MetaClears()};
         }
     }
     return state;
