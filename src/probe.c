@@ -1283,7 +1283,12 @@ static int zar_write(ZArchive *archive, int64_t node, const char *entry, const c
 static int zar_extract(int argc, char **argv) {
     ZArchive *archive = zarchive_open(argv[2]);
     if (!archive) { fprintf(stderr, "Cannot open %s: %s\n", argv[2], zarchive_error()); return 1; }
-    mkdir(argv[3], 0755);
+    /* (with the folders above it: out/zar is not there before the first .zar game, issue #80) */
+    char folder[4096];
+    snprintf(folder, sizeof(folder), "%s", argv[3]);
+    for (char *p = folder + 1; *p; ++p)
+        if (*p == '/') { *p = 0; mkdir(folder, 0755); *p = '/'; }
+    mkdir(folder, 0755);
     int failed = 0;
     for (int i = 4; i < argc && !failed; ++i) {
         int64_t node = zarchive_find(archive, argv[i]);

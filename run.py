@@ -124,6 +124,7 @@ def zar_view(zar, exe, probe, out_root):
         print(f'ZAR: extracting {", ".join(wanted)} from {zar.name}', flush=True)
         building = view.with_name(view.name + '.new')
         shutil.rmtree(building, ignore_errors=True)
+        building.parent.mkdir(parents=True, exist_ok=True)   # (out/zar: not there before the first .zar game, issue #80)
         if subprocess.run([str(probe), '--zar-extract', str(zar), str(building), *wanted], stdin=subprocess.DEVNULL,
                           creationflags=no_console()).returncode:
             fail(f'Could not read {zar}: is it a .zar made from the game folder?')
