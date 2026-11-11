@@ -1354,6 +1354,12 @@ const char* LiveShaderDebugFile() {
 LiveShaderDebug& LiveDebug() {
     static LiveShaderDebug state;
     const char* path = LiveShaderDebugFile();
+    // Called for every draw (SkipShader): the clock is read once every 256 calls of a thread
+    // (U1 chapter 2: QueryPerformanceCounter per draw was 1.6% of the draw recording thread).
+    static thread_local u32 calls = 0;
+    if (!path || (++calls & 255) != 1) {
+        return state;
+    }
     const s64 now = std::chrono::steady_clock::now().time_since_epoch().count();
     if (!path || now < state.next_read_ns.load(std::memory_order_relaxed) ||
         !state.read_mutex.try_lock()) {
@@ -2960,7 +2966,14 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    // bbport (upstream ccbc507, UntrackedStreamReads): the stream buffer is written by the host
+    // only, at a new offset every time, and never by the GPU; its reads need no barrier tracking
+    // (U1 chapter 2: the read inserts were ~7% of the draw recording thread). Linux fork: the
+    // same rule as BindBuffers' host_stream_read, under its switch (word 2 TrackedStreamReads).
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+        if (!is_written && IsHostStreamRead(buffer)) {
+            continue;
+        }
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         const auto write_flag =
