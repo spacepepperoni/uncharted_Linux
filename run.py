@@ -8,6 +8,8 @@ BB_GAME_DIR_U1 / _U2 / _U3   optional: the folder of a game that was dumped on i
               that game instead of BB_GAME_DIR (its executable may be that folder's eboot.bin)
 BB_EXE        u1 / u2 / u3 or an executable name (default u1: eboot.bin, the collection menu)
 BB_USER_DIR   saves and shader caches (default user/ beside this script)
+BB_SAVE_LAYOUT windows: saves in <BB_USER_DIR>/savedata/1/<title ID> as the Windows port (issue #83);
+              default: a folder per game
 BB_RESOLUTION / BB_RESOLUTION_U1 / _U2 / _U3   resolution WxH (default 1920x1080, the PS4's):
               the game's display settings and memory table are patched for the size it draws at
               (scripts/render_res.py, after BilalReloaded's Uncharted PC port)
@@ -448,8 +450,13 @@ def main():
     user_dir = Path(env.get('BB_USER_DIR', data / 'user')).resolve()
     user_dir.mkdir(parents=True, exist_ok=True)
     if not WINDOWS and env.get('BB_SAVEDATA_DIRS') is None:
-        split_saves(user_dir)
         import save_slots   # each game's selected save slot (issue #71); slot 1 = SAVE_FOLDERS
+        # Issue #83: BB_SAVE_LAYOUT=windows keeps slot 1 in savedata/1/<title ID> as the Windows port.
+        layout, notes = save_slots.use_layout(user_dir, env.get('BB_SAVE_LAYOUT', ''), env.get('BB_GAME_DIR', ''))
+        for note in notes:
+            print(note)
+        if layout != 'windows':
+            split_saves(user_dir)
         env['BB_SAVEDATA_DIRS'] = save_slots.mapping(user_dir)
         print(f"Saves: {env['BB_SAVEDATA_DIRS']}")
     # GPU caches (shaders, pipelines) beside the saves; read before main(), so set here.

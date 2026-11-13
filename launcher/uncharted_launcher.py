@@ -601,6 +601,7 @@ def game_environment(s, start=None):
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
     if not WINDOWS:  # Linux fork: Steam Deck mode, before the player's own variables
         uncharted_linux.update_environment(s, env)
+        uncharted_linux.save_layout_environment(s, env)
         uncharted_linux.deck_environment(s, env)
     for key, (_title, _hint, choices) in FIXES.items():
         env.update(choices.get(str(s.get(key) or 'auto'), {}))
