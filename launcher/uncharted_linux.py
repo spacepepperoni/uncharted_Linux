@@ -1361,18 +1361,11 @@ def launcher_class(base, ns):
         def build_game(self):
             """Files: the game folder, the saves folder and each game's saves, the shader cache."""
             f = self.page('game', _('Files'), '')
-            self.folder(f, 'game_dir', _('Game folder'), _('The folder with eboot.bin'),
-                        _('The folder with eboot.bin, big2-ps4_Shipping.elf and big3-ps4_Shipping.elf.'),
-                        on_change=self.refresh)
-            self.folder(f, 'update_dir', _('Update folder'), _('The folder of the game update (1.02)'),
-                        _('Optional: the game update (1.02) as its own folder. Empty: the folder named like the '
-                          'game folder with -UPDATE, when there is one beside it.'))
-            self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'),
-                        _('Empty: a Saves folder in the game folder.'))
-            self.row(f, _('Save folder layout'), self.choice(f, 'save_layout', SAVE_LAYOUTS, 46),
-                     _('Same as the Windows version keeps all saves in savedata/1/<title ID> in the Saves '
-                       'folder, as the Windows port does, so a sync tool such as Syncthing can share them '
-                       'with a Windows PC. Your saves are moved when you save this change.'))
+            # No hint texts on this page (the user, 2026-11-13).
+            self.folder(f, 'game_dir', _('Game folder'), _('The folder with eboot.bin'), on_change=self.refresh)
+            self.folder(f, 'update_dir', _('Update folder'), _('The folder of the game update (1.02)'))
+            self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'))
+            self.row(f, _('Save folder layout'), self.choice(f, 'save_layout', SAVE_LAYOUTS, 46))
             self.build_pkg_install(f)
             self.build_zar(f)
             self.section(f, _('Saves'))
@@ -1381,7 +1374,6 @@ def launcher_class(base, ns):
             self.saves_rows.grid(row=self.next_row(card), column=0, columnspan=2, sticky='we')
             self.fill_saves()
             self.section(f, _('Shader cache'))
-            self.note(f, _('Recommended to only clear if you have visual issues'), top=2)
             card = self.target(f)
             holder = self.tk.Frame(card, bg=CARD)
             holder.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(12, 0))
@@ -1397,9 +1389,7 @@ def launcher_class(base, ns):
             self.pkg_button.pack(side='left')
             self.pkg_progress = self.ttk.Progressbar(holder, length=self.px(220), maximum=1000)
             self.pkg_progress.pack(side='left', padx=(12, 0))
-            self.row(f, _('Install from PKG'), holder,
-                     _('Unpacks your fake PKG of the collection once (about 59 GB) next to the .pkg and '
-                       'fills in the game folder. An interrupted unpack continues where it stopped.'))
+            self.row(f, _('Install from PKG'), holder)
             card = self.target(f)
             self.pkg_label = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(560),
                                             justify='left')
@@ -1417,10 +1407,7 @@ def launcher_class(base, ns):
             self.zar_trim_button.pack(side='left', padx=(8, 0))
             self.zar_progress = self.ttk.Progressbar(holder, length=self.px(160), maximum=1000)
             self.zar_progress.pack(side='left', padx=(12, 0))
-            self.row(f, _('Packed game (.zar)'), holder,
-                     _('Packs the game folder and its update into one .zar beside it that the game reads '
-                       'directly (10-15 GB smaller). Then Remove unpacked files frees the space; '
-                       'your Saves folder stays.'))
+            self.row(f, _('Packed game (.zar)'), holder)
             card = self.target(f)
             self.zar_label = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(560),
                                             justify='left')
