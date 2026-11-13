@@ -581,7 +581,7 @@ def update_environment(settings, env):
 
 
 # Issue #83: where each game's saves are kept in the Saves folder.
-SAVE_LAYOUTS = [('games', 'One folder per game (Default)'),
+SAVE_LAYOUTS = [('games', 'Separate folder for each game (Default)'),
                 ('windows', 'Same as the Windows version (savedata/1/<title ID>)')]
 
 
