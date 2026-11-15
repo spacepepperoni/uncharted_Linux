@@ -601,7 +601,12 @@ def deck_environment(settings, env):
     rate = str(settings.get('frame_rate') or '')
     env['BB_VBLANK_HZ'] = rate if rate in DECK_FRAME_RATES else DECK_SETTINGS['frame_rate']
     env['BB_WINDOW_SIZE'] = '1280x800'   # the Deck's screen: no 1080p output pass to scale down
-    env['BB_RENDER_720P'] = '1'          # all three games render at 1280x720 (scripts/render_720p.py)
+    # 16:10 (test, the user's ask 2026-11-15): the games render at the Deck's own 1280x800 through
+    # BB_GAME_RES (runtime_display.c sets the size and the projection's aspect, so the view widens
+    # instead of stretching; menus stay 16:9 in the middle), not at 1280x720 with bars
+    # (BB_RENDER_720P, scripts/render_720p.py). Back to 720p: Environment entries
+    # BB_GAME_RES=off BB_RENDER_720P=1.
+    env['BB_GAME_RES'] = '1280x800'
     env['BB_PRESENT_MODE'] = 'Fifo'      # gamescope paces FIFO best
     env['BB_FULLSCREEN'] = '1'
     env['BB_FRAME_STATS'] = '1'          # frame time breakdown in last_run.log (tuning the Deck)
