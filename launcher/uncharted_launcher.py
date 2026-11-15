@@ -601,6 +601,7 @@ def game_environment(s, start=None):
     env['BB_FRAME_GEN_MULTIPLIER'] = str(s.get('frame_gen_multiplier') or '2')
     if not WINDOWS:  # Linux fork: Steam Deck mode, before the player's own variables
         uncharted_linux.update_environment(s, env)
+        uncharted_linux.save_layout_environment(s, env)
         uncharted_linux.deck_environment(s, env)
     for key, (_title, _hint, choices) in FIXES.items():
         env.update(choices.get(str(s.get(key) or 'auto'), {}))
@@ -1523,11 +1524,10 @@ class Launcher:
         self.check(f, 'mouse_invert_y', _('Invert the mouse vertically'))
 
         self.section(f, _('Button pictures'))
-        self.row(f, _('Show in the game'), self.choice(f, 'button_prompts', BUTTON_PROMPTS, 40),
-                 _('The pictures of buttons in menus and hints. Automatic shows your keys while you use '
-                   'the keyboard or mouse, Xbox buttons after an Xbox (or other) controller, and the '
-                   'PlayStation buttons after a PlayStation controller. Steam Deck buttons are the Xbox ones '
-                   'with A, B, X and Y in black and white; Steam Deck mode uses them in place of the Xbox ones.'))
+        card = self.target(f)   # only the drop-down under the heading (the user, 2026-11-13)
+        prompts = self.choice(f, 'button_prompts', BUTTON_PROMPTS, 40)
+        prompts.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(8, 0), in_=card)
+        prompts.lift()
 
         self.section(f, _('Keyboard and mouse buttons'))
         self.note(f, _('Click a box, then press a key or a mouse button (the wheel counts too). '
@@ -1580,8 +1580,7 @@ class Launcher:
         self.controller_status = self.ttk.Label(self.target(f), text=_('Checking vibration support…'),
                                                 style='Muted.TLabel')
         self.row(f, _('Status'), self.controller_status)
-        self.check(f, 'pad_vibration', _('Controller vibration'),
-                   _('The setting applies the next time the game starts.'))
+        self.check(f, 'pad_vibration', _('Controller vibration'))
         self.row(f, _('Vibration intensity'),
                  Slider(self.tk, self.target(f), self.var('pad_vibration_strength'), 0, 100, 5,
                         COLORS, self.px, self.font_ui_md, fmt='{:.0f}', width=300, suffix='%'))

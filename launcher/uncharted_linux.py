@@ -456,6 +456,7 @@ def apply_defaults(ns):
     SteamOS) and a 30 FPS frame rate."""
     ns['APP_DEFAULTS'].setdefault('steam_deck', steam_deck())
     ns['APP_DEFAULTS'].setdefault('update_dir', '')  # the title update's folder (Files page)
+    ns['APP_DEFAULTS'].setdefault('save_layout', 'games')  # issue #83 (Files page)
     # No Fixes page: each fix stays automatic (run.py turns it on where it helps), whatever an
     # earlier version saved for it.
     for key, (title, hint, _choices) in ns['FIXES'].items():
@@ -517,7 +518,7 @@ ROW_HINTS = {'Frame rate': None,
 # player's name, pictures and Steam shortcut, the interface language and what the Library shows.
 # Setup, not settings: without them the games would not start.
 RESET_KEEPS = frozenset({'game_dir', 'game_dir_u1', 'game_dir_u2', 'game_dir_u3', 'user_dir',
-                         'update_dir', 'player_name', 'ui_language', 'start', 'trophy_game',
+                         'update_dir', 'save_layout', 'player_name', 'ui_language', 'start', 'trophy_game',
                          'art_banner', 'art_u1', 'art_u2', 'art_u3', 'steam_art', 'art_crops',
                          'shortcut_name', 'shortcut_icon'})
 
@@ -577,6 +578,17 @@ def update_environment(settings, env):
     folder = str(settings.get('update_dir') or '').strip()
     if folder:
         env['BB_GAME_UPDATE_DIR'] = folder
+
+
+# Issue #83: where each game's saves are kept in the Saves folder.
+SAVE_LAYOUTS = [('games', 'Separate folder for each game (Default)'),
+                ('windows', 'Same as the Windows version (savedata/1/<title ID>)')]
+
+
+def save_layout_environment(settings, env):
+    """BB_SAVE_LAYOUT for run.py (scripts/save_slots.py use_layout)."""
+    if settings.get('save_layout') == 'windows':
+        env['BB_SAVE_LAYOUT'] = 'windows'
 
 
 def deck_environment(settings, env):
@@ -1011,12 +1023,6 @@ def launcher_class(base, ns):
             self.show_version(saved, GOLD)
             self.root.after(2500, lambda: label.cget('text') == saved and self.show_version(*self.corner_before))
 
-        def collect(self):
-            super().collect()
-            if hasattr(self, 'saved_settings'):
-                self.saved_settings = self.settings_now()
-                self.after_setting_change()
-
         def choice(self, parent, key, options, width=36):
             """The launcher's drop-down, with the choices the Steam Deck cannot run greyed out
             (and not selectable) while Steam Deck mode is on."""
@@ -1355,14 +1361,11 @@ def launcher_class(base, ns):
         def build_game(self):
             """Files: the game folder, the saves folder and each game's saves, the shader cache."""
             f = self.page('game', _('Files'), '')
-            self.folder(f, 'game_dir', _('Game folder'), _('The folder with eboot.bin'),
-                        _('The folder with eboot.bin, big2-ps4_Shipping.elf and big3-ps4_Shipping.elf.'),
-                        on_change=self.refresh)
-            self.folder(f, 'update_dir', _('Update folder'), _('The folder of the game update (1.02)'),
-                        _('Optional: the game update (1.02) as its own folder. Empty: the folder named like the '
-                          'game folder with -UPDATE, when there is one beside it.'))
-            self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'),
-                        _('Empty: a Saves folder in the game folder.'))
+            # No hint texts on this page (the user, 2026-11-13).
+            self.folder(f, 'game_dir', _('Game folder'), _('The folder with eboot.bin'), on_change=self.refresh)
+            self.folder(f, 'update_dir', _('Update folder'), _('The folder of the game update (1.02)'))
+            self.folder(f, 'user_dir', _('Saves folder'), _('Where saves and the shader cache are kept'))
+            self.row(f, _('Save folder layout'), self.choice(f, 'save_layout', SAVE_LAYOUTS, 46))
             self.build_pkg_install(f)
             self.build_zar(f)
             self.section(f, _('Saves'))
@@ -1371,7 +1374,6 @@ def launcher_class(base, ns):
             self.saves_rows.grid(row=self.next_row(card), column=0, columnspan=2, sticky='we')
             self.fill_saves()
             self.section(f, _('Shader cache'))
-            self.note(f, _('Recommended to only clear if you have visual issues'), top=2)
             card = self.target(f)
             holder = self.tk.Frame(card, bg=CARD)
             holder.grid(row=self.next_row(card), column=0, columnspan=2, sticky='w', pady=(12, 0))
@@ -1387,9 +1389,7 @@ def launcher_class(base, ns):
             self.pkg_button.pack(side='left')
             self.pkg_progress = self.ttk.Progressbar(holder, length=self.px(220), maximum=1000)
             self.pkg_progress.pack(side='left', padx=(12, 0))
-            self.row(f, _('Install from PKG'), holder,
-                     _('Unpacks your fake PKG of the collection once (about 59 GB) next to the .pkg and '
-                       'fills in the game folder. An interrupted unpack continues where it stopped.'))
+            self.row(f, _('Install from PKG'), holder)
             card = self.target(f)
             self.pkg_label = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(560),
                                             justify='left')
@@ -1407,10 +1407,7 @@ def launcher_class(base, ns):
             self.zar_trim_button.pack(side='left', padx=(8, 0))
             self.zar_progress = self.ttk.Progressbar(holder, length=self.px(160), maximum=1000)
             self.zar_progress.pack(side='left', padx=(12, 0))
-            self.row(f, _('Packed game (.zar)'), holder,
-                     _('Packs the game folder and its update into one .zar beside it that the game reads '
-                       'directly (10-15 GB smaller). Then Remove unpacked files frees the space; '
-                       'your Saves folder stays.'))
+            self.row(f, _('Packed game (.zar)'), holder)
             card = self.target(f)
             self.zar_label = self.ttk.Label(card, text='', style='Muted.TLabel', wraplength=self.px(560),
                                             justify='left')
@@ -1881,6 +1878,34 @@ def launcher_class(base, ns):
             if self.app.get('user_dir') != before and 'user_dir' in self.vars:
                 self.vars['user_dir'].set(self.app['user_dir'])  # the Game page shows it
             super().collect()
+            self.apply_save_layout()
+            if hasattr(self, 'saved_settings'):   # what Save changes and Reset to defaults compare with
+                self.saved_settings = self.settings_now()
+                self.after_setting_change()
+
+        def apply_save_layout(self):
+            """Issue #83: the saves move to the chosen layout when it is saved (run.py does the same
+            at every start, for a start from Steam)."""
+            if not hasattr(self, 'saves_rows') or self.process:
+                return
+            import save_slots
+            base = self.saves_folder()
+            wanted = self.app.get('save_layout') or 'games'
+            current = 'windows' if save_slots.windows_folder(save_slots.load(base)) else 'games'
+            if wanted == current or not base.is_dir():
+                return
+            try:
+                layout, notes = save_slots.use_layout(base, wanted, self.app.get('game_dir') or '')
+            except OSError as error:
+                self.messagebox.showerror(NAME, _('Could not move the saves: {}').format(error))
+                return
+            if layout != wanted:
+                self.messagebox.showinfo(NAME, _('The saves stay in a folder per game until the game folder is '
+                                                 'chosen (the title ID comes from it).'))
+            left = [note for note in notes if 'left there' in note]
+            if left:
+                self.messagebox.showinfo(NAME, '\n'.join(left))
+            self.fill_saves()
 
         def refresh(self):
             super().refresh()
