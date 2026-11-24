@@ -725,7 +725,47 @@ static void __attribute__((ms_abi)) u3_menu_music_into_level(uint64_t rdi, uint6
     if (!told) { told=1; printf("U3 music: the London Underground music replaces the title music (issue #81)\n"); }
 }
 
+/* Uncharted 1's frame time (Linux fork). The game measures it with a raw rdtsc delta, so it follows when
+ * the CPU woke up, not when the picture is shown: 28 to 43 ms in scenes shown an even 33.3 ms apart, and
+ * 33/67 ms in turn when the Deck misses 30 FPS. What moves by speed * last frame time (the jeep) and the
+ * camera, which moves by a mix of the last two, then hop against each other (recorded in the jeep chase: hop =
+ * 0.34 * speed * the difference between the two frame times, correlation 0.89). The clock update (dt in xmm0)
+ * gets a slowly moving mean instead. The time the mean leaves over is owed and given back a tenth at a time, so
+ * game time keeps up with real time. BB_U1_DT_SMOOTH=0: the measured time, as before. */
+static float u1_dt_mean, u1_dt_owed;
+static float u1_dt_next(float raw) {
+    if (!(raw>0.0f) || raw>0.1f) { u1_dt_mean=u1_dt_owed=0.0f; return raw; } /* loading, paused, resumed */
+    if (u1_dt_mean==0.0f) u1_dt_mean=raw;
+    u1_dt_mean+=0.15f*(raw-u1_dt_mean);
+    u1_dt_owed+=raw;
+    float given=u1_dt_mean+0.10f*(u1_dt_owed-u1_dt_mean);
+    const float least=u1_dt_mean<0.01f ? 0.5f*u1_dt_mean : 0.005f; /* above 200 FPS the mean is under 5 ms */
+    if (given<least) given=least;
+    if (given>0.1f) given=0.1f;
+    u1_dt_owed-=given;
+    return given;
+}
+static void __attribute__((ms_abi)) u1_frame_time(uint64_t rdi, uint64_t rsi, uint64_t image, uint64_t r14,
+                                                  const RuntimeGuestRegs *regs) {
+    (void)rdi; (void)rsi; (void)image; (void)r14;
+    static int smooth=-1;
+    if (smooth<0) {
+        const char *env=getenv("BB_U1_DT_SMOOTH");
+        smooth=!(env && env[0]=='0');
+        printf("U1 frame time: %s\n",smooth ? "smoothed" : "as measured (BB_U1_DT_SMOOTH=0)");
+    }
+    if (!smooth) return;
+    /* The thunk's copy of xmm0 (probe.c install_game_callbacks: and rsp, -16; sub rsp, 0xb0; xmm0 at
+     * rsp+0x30), which it loads back after this call. */
+    float *dt=(float *)(((uintptr_t)regs & ~(uintptr_t)15)-0xb0+0x30);
+    *dt=u1_dt_next(*dt);
+}
 static const RuntimeGuestCallback guest_callbacks[]={
+    /* U1 clock update (dt in xmm0), build 100: push rbp; mov rbp, rsp; push r15 */
+    {"U1 frame time",
+      "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 83 ec 28 48 8b 05 ?? ?? ?? ?? 48 8b 00 48 89 45 d0 "
+      "48 8d 05 ?? ?? ?? ?? 0f b6 00 0f b6 4f 02 39 c8",
+      0x0, 6, u1_frame_time, NULL},
     /* U1 follow camera, build 100 */
     {"U1 follow camera (mouse)",
       "55 48 89 e5 41 57 41 56 41 55 41 54 53 48 81 ec 28 01 00 00 "
